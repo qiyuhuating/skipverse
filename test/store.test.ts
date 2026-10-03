@@ -87,6 +87,33 @@ describe('VectorStore', () => {
     assert.equal(again.index.size, 61);
   });
 
+  it('compact() reclaims tombstones and persists the rebuilt index', () => {
+    const dir = tmpDir();
+    const ds = genClusterData(150, 16, 6, 19);
+    let results: unknown;
+    {
+      const store = VectorStore.open({ dataDir: dir, dim: 16, metric: 'euclidean', M: 8 });
+      insert(store, ds, 0, 150);
+      for (let i = 0; i < 100; i++) store.remove(String(i));
+      const snap = path.join(dir, 'snapshot.bin');
+      const before = store.info();
+      const { before: totalBefore, after } = store.compact();
+      assert.equal(totalBefore, 150);
+      assert.equal(after, 50);
+      assert.equal(before.deleted, 100);
+      assert.ok(fs.statSync(snap).size < 20 * 1024, 'compacted snapshot must be smaller than the graveyard');
+      results = store.search(ds.queries[0]!, 5, { ef: 64 });
+      assert.equal(results.length, 5);
+      store.close();
+    }
+    {
+      const store = VectorStore.open({ dataDir: dir, dim: 16 });
+      assert.equal(store.index.size, 50);
+      assert.equal(store.index.deletedCount, 0);
+      assert.deepEqual(store.search(ds.queries[0]!, 5, { ef: 64 }), results);
+    }
+  });
+
   it('refuses a dim mismatch and validates the meta file', () => {
     const dir = tmpDir();
     const store = VectorStore.open({ dataDir: dir, dim: 16 });

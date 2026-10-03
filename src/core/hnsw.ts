@@ -185,6 +185,7 @@ export class HnswIndex {
     if (this.entry === -1) return empty;
     const q = prepareVector(query, this.metric, this.dim);
     const ef = Math.max(options.ef ?? Math.max(k, 16), k);
+    const filter = options.filter;
 
     const trace: TraceLayer[] = wantTrace ? [] : [];
     let ep = this.entry;
@@ -205,11 +206,12 @@ export class HnswIndex {
     }
 
     const layer0Hops: { from: number; to: number; dist: number }[] | undefined = wantTrace ? [] : undefined;
-    const { cands, visited } = this.searchLayer(q, [ep], ef, 0, layer0Hops);
+    const { cands, visited } = this.searchLayer(q, [ep], ef, 0, layer0Hops, filter);
     const results: SearchResult[] = [];
     for (const c of cands) {
-      if (!this.nodes[c.h]!.deleted) {
-        results.push({ id: this.nodes[c.h]!.id, dist: c.d });
+      const id = this.nodes[c.h]!.id;
+      if (!this.nodes[c.h]!.deleted && (filter === undefined || filter(id))) {
+        results.push({ id, dist: c.d });
         if (results.length === k) break;
       }
     }
@@ -284,13 +286,18 @@ export class HnswIndex {
     return cur;
   }
 
-  /** ef-bounded beam search on one layer. Returns alive+dead candidates, sorted near→far. */
+  /**
+   * ef-bounded beam search on one layer. Returns alive+dead candidates, sorted near→far.
+   * When `filter` is set, filtered nodes are still expanded but never enter the
+   * result beam — the ef budget is spent on admissible nodes only.
+   */
   private searchLayer(
     q: Float32Array,
     eps: number[],
     ef: number,
     level: number,
     hops?: { from: number; to: number; dist: number }[],
+    filter?: (id: string) => boolean,
   ): { cands: Cand[]; visited: number } {
     const visited = new Set<number>(eps);
     const frontier = new MinHeap<Cand>((a, b) => a.d < b.d);
@@ -298,21 +305,26 @@ export class HnswIndex {
     for (const e of eps) {
       const d = this.distTo(e, q);
       frontier.push({ h: e, d });
-      best.push({ h: e, d });
+      if ((filter === undefined || filter(this.nodes[e]!.id)) && !this.nodes[e]!.deleted) {
+        best.push({ h: e, d });
+      }
     }
     while (frontier.size > 0) {
       const c = frontier.pop()!;
-      const worst = best.peek()!;
-      if (c.d > worst.d && best.size >= ef) break;
+      const worst = best.peek();
+      if (worst !== undefined && c.d > worst.d && best.size >= ef) break;
       for (const nb of this.nodes[c.h]!.links[level] ?? []) {
         if (visited.has(nb)) continue;
         visited.add(nb);
         const d = this.distTo(nb, q);
         hops?.push({ from: c.h, to: nb, dist: d });
-        if (best.size < ef || d < best.peek()!.d) {
+        const admissible = (filter === undefined || filter(this.nodes[nb]!.id)) && !this.nodes[nb]!.deleted;
+        if (admissible && (best.size < ef || d < best.peek()!.d)) {
           frontier.push({ h: nb, d });
           best.push({ h: nb, d });
           if (best.size > ef) best.pop();
+        } else if (!admissible) {
+          frontier.push({ h: nb, d });
         }
       }
     }
@@ -358,6 +370,25 @@ export class HnswIndex {
     const h = this.idToHandle.get(id);
     if (h === undefined) return null;
     return this.nodes[h]!.links.map((layer) => layer.map((nb) => this.nodes[nb]!.id));
+  }
+
+  /**
+   * Rebuild with only alive nodes, preserving insertion order. The result is a
+   * fresh deterministic graph (levels are re-sampled, generation slots vanish)
+   * — used by snapshot compaction to reclaim soft-deleted space.
+   */
+  compacted(): HnswIndex {
+    const fresh = new HnswIndex({
+      dim: this.dim,
+      metric: this.metric,
+      M: this.M,
+      efConstruction: this.efConstruction,
+      seed: this.seed,
+    });
+    for (const node of this.nodes) {
+      if (!node.deleted) fresh.add(node.id, node.vec);
+    }
+    return fresh;
   }
 
   // ------------------------------------------------------------- persistence

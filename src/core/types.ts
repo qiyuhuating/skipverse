@@ -3,6 +3,11 @@ export type Metric = 'euclidean' | 'cosine' | 'dot';
 export interface SearchOptions {
   /** candidate list size during layer-0 search; higher = better recall, slower */
   ef?: number;
+  /**
+   * filtered-out nodes are excluded from results but still traversed —
+   * hnswlib semantics. Raise `ef` when filters are very selective.
+   */
+  filter?: (id: string) => boolean;
 }
 
 export interface SearchResult {

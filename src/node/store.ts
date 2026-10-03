@@ -45,7 +45,8 @@ interface Meta {
  * stays honest about crash boundaries.
  */
 export class VectorStore {
-  readonly index: HnswIndex;
+  /** Swapped out by `compact()`; treat as immutable between calls. */
+  index: HnswIndex;
   readonly dataDir: string;
 
   private walFd: number;
@@ -171,6 +172,17 @@ export class VectorStore {
     fs.renameSync(tmp, this.snapshotPath);
     fs.truncateSync(this.walPath, 0);
     this.opsSinceCheckpoint = 0;
+  }
+
+  /**
+   * Rebuild the index from alive vectors only (drops soft-deleted slots) and
+   * rotate a fresh snapshot + empty WAL. Deterministic; levels are re-sampled.
+   */
+  compact(): { before: number; after: number } {
+    const before = this.index.size + this.index.deletedCount;
+    this.index = this.index.compacted();
+    this.checkpoint();
+    return { before, after: this.index.size };
   }
 
   close(checkpoint = false): void {
