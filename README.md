@@ -13,7 +13,7 @@
 
 *The demo is the same engine that ships on npm — running in your browser. Watch the green token dive through layers 2 → 1 → 0, then the gold rings light up the top-k. [Live demo →](https://qiyuhuating.github.io/skipverse/)*
 
-<video src="docs/demo.webm" controls muted loop playsinline width="820"></video>
+![](docs/demo.gif)
 
 ---
 
