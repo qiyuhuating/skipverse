@@ -19,10 +19,16 @@ const METRIC_CODE: Record<Metric, number> = { euclidean: 0, cosine: 1, dot: 2 };
 const METRIC_BY_CODE: Metric[] = ['euclidean', 'cosine', 'dot'];
 
 export type Quantization = 'none' | 'sq8';
-/** per-node scalars that make quantized cosine/dot distances exact-ish */
+/**
+ * per-node scalars derived from the u8 codes + calibration (never serialized —
+ * recomputed on load): cosine/dot need `dotC`/`norm` for the symmetric
+ * expansion; euclidean needs `selfW`/`xsm` for asymmetric distance computation.
+ */
 interface Aux {
   dotC: number;
   norm: number;
+  selfW: number;
+  xsm: number;
 }
 
 interface Node {
@@ -52,10 +58,19 @@ export interface Calibration {
   k: number;
 }
 
-/** A query (or node vector) paired with its aux scalars, as the distance kernel sees it. */
+/**
+ * What the distance kernels see. Post-calibration the stored side is always
+ * u8+aux. The *query* side depends on the metric: cosine/dot search in fully
+ * quantized space (query quantized too); euclidean uses asymmetric distance
+ * computation — the query keeps full precision (carrying `qs = v⊙step`,
+ * `qm = Σ v·min`, `q2 = Σ v²`) and only the data side is dequantized.
+ */
 interface QVec {
   vec: Float32Array | Uint8Array;
   aux: Aux | null;
+  qs?: Float32Array;
+  qm?: number;
+  q2?: number;
 }
 
 export interface HnswParams {
@@ -111,8 +126,10 @@ export class HnswIndex {
 
   /** full-precision kernel (pre-calibration) */
   private distF32: DistanceFn;
-  /** quantized kernel (post-calibration): (a, aAux, b, bAux) → distance */
+  /** quantized symmetric kernel (post-calibration): u8 codes on both sides */
   private distQ: ((a: QVec, b: QVec) => number) | null = null;
+  /** asymmetric kernel (calibrated euclidean only): exact query × dequantized code */
+  private distAdc: ((node: QVec, q: QVec) => number) | null = null;
 
   constructor(params: HnswParams) {
     const { dim } = params;
@@ -151,10 +168,9 @@ export class HnswIndex {
     return this.calibration !== null;
   }
 
-  /** bytes a stored vector occupies (excluding graph links) */
+  /** bytes a stored vector occupies (excluding graph links) — one byte per dimension */
   get bytesPerVector(): number {
-    if (this.calibration !== null) return this.dim + (this.needsAux() ? 8 : 0);
-    return this.dim * 4;
+    return this.calibration !== null ? this.dim : this.dim * 4;
   }
 
   /**
@@ -189,11 +205,12 @@ export class HnswIndex {
     }
     this.calibration = { min, max, step, c, k };
     this.distQ = this.metric === 'euclidean' ? distQEuclidean(this.calibration) : distQIp(this.calibration, this.metric === 'cosine');
+    this.distAdc = this.metric === 'euclidean' ? distQAdcEuclidean(this.calibration) : null;
 
     for (const node of this.nodes) {
       const u8 = this.quantizeToU8(node.vec as Float32Array);
       node.vec = u8;
-      node.aux = this.needsAux() ? this.auxOf(u8) : null;
+      node.aux = this.auxOf(u8);
     }
   }
 
@@ -202,19 +219,19 @@ export class HnswIndex {
   /** Insert or replace. Replacing soft-deletes the previous vector. */
   add(id: string, vec: ArrayLike<number>): void {
     if (this.calibration !== null && vec instanceof Uint8Array) {
-      this.insertPrepared(id, vec, this.needsAux() ? this.auxOf(vec) : null);
+      this.insertPrepared(id, vec, this.auxOf(vec));
       return;
     }
     const f = prepareVector(vec, this.metric, this.dim);
-    if (this.calibration !== null) {
-      const u8 = this.quantizeToU8(f);
-      this.insertPrepared(id, u8, this.needsAux() ? this.auxOf(u8) : null);
-    } else {
+    if (this.calibration === null) {
       this.insertPrepared(id, f, null);
+    } else {
+      const u8 = this.quantizeToU8(f);
+      this.insertPrepared(id, u8, this.auxOf(u8), f);
     }
   }
 
-  private insertPrepared(id: string, vec: Float32Array | Uint8Array, aux: Aux | null): void {
+  private insertPrepared(id: string, vec: Float32Array | Uint8Array, aux: Aux | null, exact?: Float32Array): void {
     const old = this.idToHandle.get(id);
     if (old !== undefined) {
       const oldNode = this.nodes[old]!;
@@ -245,7 +262,10 @@ export class HnswIndex {
       return;
     }
 
-    const q: QVec = { vec, aux };
+    const q: QVec =
+      this.calibration !== null && this.metric === 'euclidean' && exact !== undefined
+        ? this.adcQuery(exact)
+        : { vec, aux };
     let eps: number[] = [this.entry];
     for (let l = this.maxLevel; l > level; l--) {
       eps = [this.greedy(q, eps[0]!, l)];
@@ -253,7 +273,7 @@ export class HnswIndex {
     for (let l = Math.min(level, this.maxLevel); l >= 0; l--) {
       const { cands } = this.searchLayer(q, eps, this.efConstruction, l);
       const maxM = l === 0 ? this.M0 : this.M;
-      const selected = this.selectNeighbors(q, cands, this.M);
+      const selected = this.selectNeighbors(cands, this.M);
       this.nodes[h]!.links[l] = selected;
       for (const nb of selected) {
         const nbLinks = this.nodes[nb]!.links[l]!;
@@ -390,7 +410,11 @@ export class HnswIndex {
     });
     if (this.calibration !== null) fresh.adoptCalibration(this.calibration);
     for (const node of this.nodes) {
-      if (!node.deleted) fresh.insertPrepared(node.id, node.vec, node.aux);
+      if (!node.deleted) {
+        // calibrated euclidean: re-anchor inserts on the dequantized vector
+        const exact = this.calibration !== null && this.metric === 'euclidean' ? this.dequantize(node.vec as Uint8Array) : undefined;
+        fresh.insertPrepared(node.id, node.vec, node.aux, exact);
+      }
     }
     return fresh;
   }
@@ -408,21 +432,47 @@ export class HnswIndex {
     return out;
   }
 
-  /** dequantized L2 norm and code-space c-projection Σ c_d·q_d (cosine/dot aux) */
+  /** dequantized aux scalars, fully derivable from codes + calibration */
   private auxOf(u8: Uint8Array): Aux {
     const cal = this.calibration!;
     let dotC = 0;
     let norm2 = 0;
+    let selfW = 0;
+    let xsm = 0;
     for (let d = 0; d < this.dim; d++) {
-      dotC += u8[d]! * cal.c[d]!;
-      const v = u8[d]! * cal.step[d]! + cal.min[d]!;
+      const q = u8[d]!;
+      const v = q * cal.step[d]! + cal.min[d]!;
+      dotC += q * cal.c[d]!;
       norm2 += v * v;
+      selfW += q * q * cal.step[d]! * cal.step[d]!;
+      xsm += q * cal.step[d]! * cal.min[d]!;
     }
-    return { dotC, norm: Math.sqrt(norm2) };
+    return { dotC, norm: Math.sqrt(norm2), selfW, xsm };
   }
 
   private needsAux(): boolean {
-    return this.metric !== 'euclidean';
+    return this.calibration !== null;
+  }
+
+  /** asymmetric query context: exact f32 query reduced to (v⊙step, v·min, ‖v‖²) */
+  private adcQuery(f: Float32Array): QVec {
+    const cal = this.calibration!;
+    const qs = new Float32Array(this.dim);
+    let qm = 0;
+    let q2 = 0;
+    for (let d = 0; d < this.dim; d++) {
+      qs[d] = f[d]! * cal.step[d]!;
+      qm += f[d]! * cal.min[d]!;
+      q2 += f[d]! * f[d]!;
+    }
+    return { vec: f, aux: null, qs, qm, q2 };
+  }
+
+  private dequantize(u8: Uint8Array): Float32Array {
+    const cal = this.calibration!;
+    const out = new Float32Array(this.dim);
+    for (let d = 0; d < this.dim; d++) out[d] = u8[d]! * cal.step[d]! + cal.min[d]!;
+    return out;
   }
 
   /** f32 or u8 query, with aux scalars for the quantized cosine kernel */
@@ -431,20 +481,17 @@ export class HnswIndex {
       if (query instanceof Uint8Array) throw new Error('internal: u8 query on uncalibrated index');
       return { vec: prepareVector(query, this.metric, this.dim), aux: null };
     }
-    if (query instanceof Uint8Array) return { vec: query, aux: this.needsAux() ? this.auxOf(query) : null };
     const f = prepareVector(query, this.metric, this.dim);
+    if (this.metric === 'euclidean') return this.adcQuery(f);
     const u8 = this.quantizeToU8(f);
-    return { vec: u8, aux: this.needsAux() ? this.auxOf(u8) : null };
-  }
-
-  private distQOf(): (a: QVec, b: QVec) => number {
-    return this.distQ!;
+    return { vec: u8, aux: this.auxOf(u8) };
   }
 
   private dist(h: number, q: QVec): number {
     const node = this.nodes[h]!;
-    if (this.calibration !== null) return this.distQOf()(node, q);
-    return this.distF32(node.vec as Float32Array, q.vec as Float32Array);
+    if (this.calibration === null) return this.distF32(node.vec as Float32Array, q.vec as Float32Array);
+    if (this.metric === 'euclidean') return this.distAdc!(node, q);
+    return this.distQ!({ vec: node.vec, aux: node.aux }, q);
   }
 
   private distNN(a: number, b: number): number {
@@ -453,7 +500,7 @@ export class HnswIndex {
     }
     const na = this.nodes[a]!;
     const nb = this.nodes[b]!;
-    return this.distQOf()({ vec: na.vec, aux: na.aux }, { vec: nb.vec, aux: nb.aux });
+    return this.distQ!({ vec: na.vec, aux: na.aux }, { vec: nb.vec, aux: nb.aux });
   }
 
   // ------------------------------------------------------------------- graph
@@ -538,7 +585,7 @@ export class HnswIndex {
    * scan candidates near→far, keep one only if it is closer to the base point
    * than to every already-kept neighbor. Prevents mutual-cluster hubs.
    */
-  private selectNeighbors(base: QVec, cands: Cand[], M: number): number[] {
+  private selectNeighbors(cands: Cand[], M: number): number[] {
     const sorted = cands.slice().sort((a, b) => a.d - b.d);
     const kept: Cand[] = [];
     for (const c of sorted) {
@@ -559,9 +606,8 @@ export class HnswIndex {
   private shrink(h: number, level: number, maxM: number): void {
     const node = this.nodes[h]!;
     const links = node.links[level]!;
-    const self: QVec = { vec: node.vec, aux: node.aux };
-    const cands = links.map((x) => ({ h: x, d: this.dist(x, self) }));
-    node.links[level] = this.selectNeighbors(self, cands, maxM);
+    const cands = links.map((x) => ({ h: x, d: this.distNN(x, h) }));
+    node.links[level] = this.selectNeighbors(cands, maxM);
   }
 
   // ------------------------------------------------------------- calibration IO
@@ -573,6 +619,7 @@ export class HnswIndex {
     if (cal.min.length !== this.dim) throw new Error('calibration dim mismatch');
     this.calibration = cal;
     this.distQ = this.metric === 'euclidean' ? distQEuclidean(cal) : distQIp(cal, this.metric === 'cosine');
+    this.distAdc = this.metric === 'euclidean' ? distQAdcEuclidean(cal) : null;
   }
 
   // ------------------------------------------------------------- persistence
@@ -601,9 +648,6 @@ export class HnswIndex {
       if (cal !== null) {
         const v = node.vec as Uint8Array;
         for (let i = 0; i < this.dim; i++) w.u8(v[i]!);
-        if (this.needsAux()) {
-          w.f32(node.aux!.dotC).f32(node.aux!.norm);
-        }
       } else {
         const v = node.vec as Float32Array;
         for (let i = 0; i < this.dim; i++) w.f32(v[i]!);
@@ -666,12 +710,10 @@ export class HnswIndex {
       const deleted = r.u8() === 1;
       if (level > MAX_LEVEL) throw new Error(`corrupt index: node level ${level} > ${MAX_LEVEL}`);
       let vec: Float32Array | Uint8Array;
-      let aux: Aux | null = null;
       if (quantCode === 2) {
         const u8 = new Uint8Array(dim);
         for (let j = 0; j < dim; j++) u8[j] = r.u8();
         vec = u8;
-        if (metric !== 'euclidean') aux = { dotC: r.f32(), norm: r.f32() };
       } else {
         const f = new Float32Array(dim);
         for (let j = 0; j < dim; j++) f[j] = r.f32();
@@ -688,13 +730,17 @@ export class HnswIndex {
         }
         links.push(layerLinks);
       }
-      idx.nodes.push({ id, vec, level, deleted, links, aux });
+      idx.nodes.push({ id, vec, level, deleted, links, aux: null });
       if (!deleted) {
         idx.idToHandle.set(id, i);
         idx.alive++;
       } else {
         idx.deleted++;
       }
+    }
+    // aux scalars are pure functions of (codes, calibration) — rebuild, don't store
+    if (quantCode === 2) {
+      for (const node of idx.nodes) node.aux = idx.auxOf(node.vec as Uint8Array);
     }
     if (entry !== -1) {
       if (entry >= count) throw new Error('corrupt index: entry point out of range');
@@ -710,9 +756,10 @@ export class HnswIndex {
 
 // ------------------------------------------------------------ quantized kernels
 
-/** euclidean in quantized space, reweighted by each dimension's step² */
+/** euclidean over u8 codes on both sides (node-node distances in ADC mode) */
 function distQEuclidean(cal: Calibration): (a: QVec, b: QVec) => number {
-  const { step, dim } = { step: cal.step, dim: cal.min.length };
+  const { step, min } = cal;
+  const dim = min.length;
   return (a, b) => {
     const va = a.vec as Uint8Array;
     const vb = b.vec as Uint8Array;
@@ -726,7 +773,29 @@ function distQEuclidean(cal: Calibration): (a: QVec, b: QVec) => number {
 }
 
 /**
- * cosine / dot in quantized space. With v = q·step + min:
+ * Asymmetric distance computation for euclidean: the query keeps full f32
+ * precision and the data side is dequantized in-register.
+ *   ‖v_a − v_b‖² = ‖v_a‖² − 2·v_a·v_b + ‖v_b‖²
+ *   v_a·v_b      = dot(qs, q_b) + qm          (qs = v_a⊙step, qm = Σ v_a·min)
+ *   ‖v_b‖²       = selfW + 2·xsm + K          (per-node precomputed scalars)
+ * so each pair costs one dim-loop plus three scalars, and the query's
+ * quantization noise — half of the total in symmetric codes — disappears.
+ */
+function distQAdcEuclidean(cal: Calibration): (node: QVec, q: QVec) => number {
+  const { step, min, k } = cal;
+  const dim = min.length;
+  return (node, q) => {
+    const qb = node.vec as Uint8Array;
+    const qs = q.qs!;
+    let dot = 0;
+    for (let d = 0; d < dim; d++) dot += qs[d]! * qb[d]!;
+    const d2 = q.q2! - 2 * (dot + q.qm!) + node.aux!.selfW + 2 * node.aux!.xsm + k;
+    return Math.sqrt(Math.max(0, d2));
+  };
+}
+
+/**
+ * cosine / dot over u8 codes on both sides. With v = q·step + min:
  *   v·v′ = q·W·q′ + c·q + c·q′ + K   (W = step²ᵈ, c = step·min, K = Σ min²)
  * Both sides carry `dotC = Σ c_d·q_d` and the dequantized L2 norm as
  * precomputed scalars, so the per-pair cost is one weighted dot plus three

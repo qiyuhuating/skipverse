@@ -109,11 +109,12 @@ idx.calibrate();     // freezes per-dimension [min,max], rewrites vectors as u8 
 idx.add("new-doc", vec);   // later inserts are quantized through the frozen ranges
 ```
 
-Under the hood the quantized kernels do real math, not byte-tricks: euclidean is reweighted by each dimension's
-step²; cosine/dot use the identity `v·v′ = q·W·q′ + c·q + c·q′ + K` (with `W = step²`, `c = step·min`, `K = Σmin²`)
-so each pair costs one weighted dot product plus three precomputed scalars — no per-dimension affine work
-(cosine/dot carry an 8-byte aux scalar pair per vector). Serialized as format v2 (u8 flag + calibration table); v1
-indexes still load.
+Under the hood the quantized kernels do real math, not byte-tricks. For **euclidean**, search uses *asymmetric
+distance computation*: the query stays exact f32 (reduced to `v⊙step`, `v·min`, `‖v‖²`) and each pair costs one
+dim-loop plus three scalars against the dequantized code. For **cosine/dot**, both sides are u8 codes evaluated via
+the identity `v·v′ = q·W·q′ + c·q + c·q′ + K` (with `W = step²`, `c = step·min`, `K = Σmin²`) — one weighted dot plus
+three precomputed scalars. The per-node aux scalars are pure functions of (codes, calibration), so they're rebuilt
+on load instead of stored. Serialized as format v2 (u8 flag + calibration table); v1 indexes still load.
 
 ## The trace: search you can read
 
@@ -180,26 +181,25 @@ Deterministic, seeded, reproducible (`npm run bench`):
 
 | mode | efSearch | recall@10 | QPS | avg nodes visited |
 |:-----|---------:|----------:|----:|------------------:|
-| f32 | 16 | 0.9650 | 12,485 | 288.9 |
-| f32 | 64 | 1.0000 | 3,985 | 501.9 |
-| f32 | 128 | 1.0000 | 3,232 | 571.1 |
-| sq8 | 16 | 0.8460 | 9,449 | 290.2 |
-| sq8 | 64 | 0.8640 | 4,867 | 502.6 |
-| sq8 | 128 | 0.8640 | 3,062 | 570.9 |
-| brute force | — | 1.0000 | 383 | 10,000 |
+| f32 | 16 | 0.9650 | 13,696 | 288.9 |
+| f32 | 64 | 1.0000 | 5,855 | 501.9 |
+| f32 | 128 | 1.0000 | 3,562 | 571.1 |
+| sq8 (ADC) | 16 | 0.9400 | 12,197 | 288.1 |
+| sq8 (ADC) | 64 | 0.9720 | 5,078 | 502.1 |
+| sq8 (ADC) | 128 | 0.9720 | 3,331 | 570.9 |
+| brute force | — | 1.0000 | 420 | 10,000 |
 
-build: f32 3.47s · sq8 3.80s (incl. calibration) · vector storage: f32 256 B/vec → sq8 64 B/vec (**4.0× smaller**).
+build: f32 3.26s · sq8 3.39s (incl. calibration) · vector storage: f32 256 B/vec → sq8 64 B/vec (**4.0× smaller**).
 
-Reading the table honestly: at ef=64 the f32 index is **10× brute force at identical recall** (33× at ef=16).
+Reading the table honestly: at ef=64 the f32 index is **~15× brute force at identical recall** (32× at ef=16).
 Queries are in-distribution (data point + N(0, 0.3) noise) — deliberately off-manifold queries are the known weak
 spot of greedy graph search, in this implementation and every other.
 
-SQ8 trades accuracy for footprint, and the table shows the real price on this clustered geometry: **4× smaller
-vectors and ~22% higher QPS** (less memory traffic) at a cost of ~14 recall points. The recall plateau across
-ef 64 → 128 says that's quantization ranking noise on near-tie neighbors, not search budget — this dataset's tight
-gaussian blobs produce many almost-equal distances, exactly where 8-bit codes hurt most. Spread-out distributions
-lose far less. If you need the memory back without the loss: asymmetric distance computation and residual codes are
-on the roadmap.
+SQ8 trades a little accuracy for a lot of footprint: **4× smaller vectors at ~87% of the f32 QPS and −2.8 recall
+points** at ef=64. The win comes from asymmetric distance computation — the query stays full-precision f32 and only
+the stored side is a u8 code, which removes half the quantization noise (symmetric codes scored 0.864 on this
+dataset before ADC; the residual plateau at 0.972 is the data-side noise). Tight gaussian blobs produce many
+near-tie distances, exactly where 8-bit codes hurt most; spread-out distributions lose even less.
 
 ## Zero dependencies
 
@@ -216,7 +216,6 @@ should not include 200 transitive packages, and the algorithm is the product.
 
 ## Roadmap
 
-- [ ] asymmetric distance computation (f32 query × u8 codes) to claw back SQ8 recall
 - [ ] SQ4/PQ residual refinement for memory-bound fleets
 - [ ] online recalibration when the data distribution drifts
 - [ ] concurrent readers (copy-on-write snapshot reads)
