@@ -1,10 +1,15 @@
 export { genClusterData, type Dataset } from '../src/core/dataset.js';
-import { makeDistance, type DistanceFn } from '../src/core/distance.js';
+import { makeDistance, normalize, type DistanceFn } from '../src/core/distance.js';
 import type { Metric } from '../src/core/types.js';
 
 export function bruteForce(vecs: Float32Array[], q: Float32Array, k: number, metric: Metric): { id: string; dist: number }[] {
   const dist = makeDistance(metric);
-  const scored = vecs.map((v, i) => ({ id: String(i), dist: dist(v, q) }));
+  // the cosine kernel assumes L2-normalized inputs (as the index does)
+  const nq = metric === 'cosine' ? normalize(Float32Array.from(q)) : q;
+  const scored = vecs.map((v, i) => ({
+    id: String(i),
+    dist: metric === 'cosine' ? dist(normalize(Float32Array.from(v)), nq) : dist(v, q),
+  }));
   scored.sort((a, b) => a.dist - b.dist);
   return scored.slice(0, k);
 }

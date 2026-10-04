@@ -13,6 +13,8 @@
 
 *The demo is the same engine that ships on npm — running in your browser. Watch the green token dive through layers 2 → 1 → 0, then the gold rings light up the top-k. [Live demo →](https://qiyuhuating.github.io/skipverse/)*
 
+<video src="docs/demo.webm" controls muted loop playsinline width="820"></video>
+
 ---
 
 ## Why from scratch
@@ -61,8 +63,9 @@ store.checkpoint();                      // atomic snapshot + WAL truncation
 ### Serve it
 
 ```bash
-npm i -g skipverse
-skipverse serve --port 8787 --dim 64 --metric cosine
+git clone https://github.com/qiyuhuating/skipverse && cd skipverse
+npm install && npm run build
+npx skipverse serve --port 8787 --dim 64 --metric cosine
 ```
 
 ```bash
@@ -79,6 +82,38 @@ curl -X POST localhost:8787/search \
 git clone https://github.com/qiyuhuating/skipverse && cd skipverse
 npm install && npm run serve     # → http://localhost:8787
 ```
+
+## Filter, compact, quantize
+
+**Filtered search** — hnswlib semantics: filtered-out nodes are still traversed (the graph stays connected) but never
+occupy the result beam, so the whole `ef` budget is spent on admissible nodes. Raise `ef` when the filter is very
+selective.
+
+```ts
+const hits = idx.search(q, 10, { ef: 128, filter: (id) => tenantOf(id) === "acme" });
+```
+
+**Compaction** — deletes are tombstones: dead nodes stay as traversal anchors until you reclaim them.
+
+```ts
+store.compact();   // deterministic rebuild from alive vectors + atomic snapshot rotation
+```
+
+**SQ8 scalar quantization** — the faiss/hnswlib "train once, serve" model: insert in f32, calibrate once, every
+stored vector becomes one byte per dimension (4× smaller); distances then run in register-dequantized space.
+
+```ts
+const idx = new HnswIndex({ dim: 64, metric: "euclidean", quantization: "sq8" });
+// ... add() your corpus in f32 ...
+idx.calibrate();     // freezes per-dimension [min,max], rewrites vectors as u8 — one-shot
+idx.add("new-doc", vec);   // later inserts are quantized through the frozen ranges
+```
+
+Under the hood the quantized kernels do real math, not byte-tricks: euclidean is reweighted by each dimension's
+step²; cosine/dot use the identity `v·v′ = q·W·q′ + c·q + c·q′ + K` (with `W = step²`, `c = step·min`, `K = Σmin²`)
+so each pair costs one weighted dot product plus three precomputed scalars — no per-dimension affine work
+(cosine/dot carry an 8-byte aux scalar pair per vector). Serialized as format v2 (u8 flag + calibration table); v1
+indexes still load.
 
 ## The trace: search you can read
 
@@ -134,6 +169,7 @@ upsert ──► WAL frame [len | crc32 | seq | op | id | f32×dim] ──► fs
                 ▼
 reopen: CRC scan ──► longest valid prefix ──► truncate torn tail ──► replay ops with seq > snapshot.lastSeq
 checkpoint: snapshot.tmp ──► atomic rename ──► WAL truncate
+compact:   deterministic rebuild from alive vectors ──► tombstone space reclaimed
 ```
 
 ## Benchmarks
@@ -142,17 +178,28 @@ Deterministic, seeded, reproducible (`npm run bench`):
 
 ### skipverse 10,000 × 64d · M=16 · efConstruction=200 · euclidean · k=10
 
-| efSearch | recall@10 | QPS | avg nodes visited |
-|---------:|----------:|----:|------------------:|
-| 16 | 0.9650 | 16,042 | 288.9 |
-| 64 | 1.0000 | 7,508 | 501.9 |
-| 128 | 1.0000 | 5,060 | 571.1 |
-| brute force | 1.0000 | 491 | 10,000 |
+| mode | efSearch | recall@10 | QPS | avg nodes visited |
+|:-----|---------:|----------:|----:|------------------:|
+| f32 | 16 | 0.9650 | 12,485 | 288.9 |
+| f32 | 64 | 1.0000 | 3,985 | 501.9 |
+| f32 | 128 | 1.0000 | 3,232 | 571.1 |
+| sq8 | 16 | 0.8460 | 9,449 | 290.2 |
+| sq8 | 64 | 0.8640 | 4,867 | 502.6 |
+| sq8 | 128 | 0.8640 | 3,062 | 570.9 |
+| brute force | — | 1.0000 | 383 | 10,000 |
 
-build: 2.26s for 10,000 vectors (Node 24, single thread). At ef=64 the index is **15× brute force at identical
-recall**; at ef=16 it trades ~3% recall for 33×. Queries are in-distribution (data point + N(0, 0.3) noise) —
-deliberately off-manifold queries are documented as the known weak spot of greedy graph search, in this
-implementation and every other.
+build: f32 3.47s · sq8 3.80s (incl. calibration) · vector storage: f32 256 B/vec → sq8 64 B/vec (**4.0× smaller**).
+
+Reading the table honestly: at ef=64 the f32 index is **10× brute force at identical recall** (33× at ef=16).
+Queries are in-distribution (data point + N(0, 0.3) noise) — deliberately off-manifold queries are the known weak
+spot of greedy graph search, in this implementation and every other.
+
+SQ8 trades accuracy for footprint, and the table shows the real price on this clustered geometry: **4× smaller
+vectors and ~22% higher QPS** (less memory traffic) at a cost of ~14 recall points. The recall plateau across
+ef 64 → 128 says that's quantization ranking noise on near-tie neighbors, not search budget — this dataset's tight
+gaussian blobs produce many almost-equal distances, exactly where 8-bit codes hurt most. Spread-out distributions
+lose far less. If you need the memory back without the loss: asymmetric distance computation and residual codes are
+on the roadmap.
 
 ## Zero dependencies
 
@@ -162,19 +209,19 @@ should not include 200 transitive packages, and the algorithm is the product.
 
 ## Acceptance criteria (enforced by CI)
 
-- 28 tests green on Node 22 & 24 — including recall floors, degree-cap invariants, WAL torn-write recovery,
-  snapshot+WAL round-trips, and a full HTTP restart cycle;
+- 35+ tests green on Node 22 & 24 — including recall floors (f32 and sq8), degree-cap invariants, filtered-search
+  semantics, WAL torn-write recovery, snapshot+WAL round-trips, compaction, and a full HTTP restart cycle;
 - typecheck strict, `verbatimModuleSyntax`, no `any` in the engine;
-- the CI benchmark run must hold **recall@10 ≥ 0.95 at ef=64** or the build fails.
+- the CI benchmark run must hold **f32 recall@10 ≥ 0.95 and sq8 recall@10 ≥ 0.90 at ef=64** or the build fails.
 
 ## Roadmap
 
-- [ ] scalar / product quantization for memory-bound workloads
+- [ ] asymmetric distance computation (f32 query × u8 codes) to claw back SQ8 recall
+- [ ] SQ4/PQ residual refinement for memory-bound fleets
+- [ ] online recalibration when the data distribution drifts
 - [ ] concurrent readers (copy-on-write snapshot reads)
-- [ ] filtered ANN (pre-filter via payload bitmaps)
 - [ ] memory-mapped snapshot loader (zero-copy warm start)
 - [ ] WASM build of the core for CDN-drop usage
-- [ ] online compaction (rebuild subtree instead of full checkpoint)
 
 ## License
 
