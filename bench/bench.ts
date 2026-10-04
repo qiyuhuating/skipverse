@@ -1,6 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import { HnswIndex } from '../src/core/hnsw.js';
 import type { SearchResult } from '../src/core/types.js';
+import type { Quantization } from '../src/core/hnsw.js';
 import { genClusterData } from '../src/core/dataset.js';
 import { bruteForce, recall } from '../test/helpers.js';
 import type { HnswIndex as Index } from '../src/core/hnsw.js';
@@ -15,8 +16,10 @@ interface BenchConfig {
   seed: number;
 }
 
+type Mode = 'f32' | 'sq8' | 'sq4';
+
 interface ModeResult {
-  mode: 'f32' | 'sq8';
+  mode: Mode;
   buildMs: number;
   bytesPerVector: number;
   results: { ef: number; recall: number; qps: number; visitedAvg: number }[];
@@ -24,8 +27,10 @@ interface ModeResult {
 
 const DEFAULTS: BenchConfig = { n: 10_000, dim: 64, clusters: 20, numQueries: 100, k: 10, rounds: 5, seed: 1234 };
 const SMALL: BenchConfig = { n: 4_000, dim: 32, clusters: 25, numQueries: 50, k: 10, rounds: 3, seed: 1234 };
+const MODES: Mode[] = ['f32', 'sq8', 'sq4'];
+const quantizationOf = (m: Mode): Quantization | undefined => (m === 'f32' ? undefined : m);
 
-function buildIndex(cfg: BenchConfig, mode: 'f32' | 'sq8'): Index {
+function buildIndex(cfg: BenchConfig, mode: Mode): Index {
   const { vecs } = genClusterData(cfg.n, cfg.dim, cfg.clusters, cfg.seed);
   const idx = new HnswIndex({
     dim: cfg.dim,
@@ -33,14 +38,14 @@ function buildIndex(cfg: BenchConfig, mode: 'f32' | 'sq8'): Index {
     M: 16,
     efConstruction: 200,
     seed: 42,
-    quantization: mode === 'sq8' ? 'sq8' : 'none',
+    quantization: quantizationOf(mode),
   });
   for (let i = 0; i < vecs.length; i++) idx.add(String(i), vecs[i]!);
-  if (mode === 'sq8') idx.calibrate();
+  if (mode !== 'f32') idx.calibrate();
   return idx;
 }
 
-function benchMode(cfg: BenchConfig, mode: 'f32' | 'sq8', truth: SearchResult[][]): ModeResult {
+function benchMode(cfg: BenchConfig, mode: Mode, truth: SearchResult[][]): ModeResult {
   const { vecs, queries } = genClusterData(cfg.n, cfg.dim, cfg.clusters, cfg.seed);
   const t0 = performance.now();
   const idx = buildIndex(cfg, mode);
@@ -73,8 +78,7 @@ function main(): void {
   const qs = queries.slice(0, cfg.numQueries);
   const truth = qs.map((q) => bruteForce(vecs, q, cfg.k, 'euclidean'));
 
-  const f32 = benchMode(cfg, 'f32', truth);
-  const sq8 = benchMode(cfg, 'sq8', truth);
+  const runs = MODES.map((m) => benchMode(cfg, m, truth));
 
   const t2 = performance.now();
   for (let r = 0; r < cfg.rounds; r++) {
@@ -87,30 +91,32 @@ function main(): void {
     '',
     '| mode | efSearch | recall@10 | QPS | avg nodes visited |',
     '|:-----|---------:|----------:|----:|------------------:|',
-    ...f32.results.map((x) => `| f32 | ${x.ef} | ${x.recall.toFixed(4)} | ${Math.round(x.qps).toLocaleString()} | ${x.visitedAvg.toFixed(1)} |`),
-    ...sq8.results.map((x) => `| sq8 | ${x.ef} | ${x.recall.toFixed(4)} | ${Math.round(x.qps).toLocaleString()} | ${x.visitedAvg.toFixed(1)} |`),
+    ...runs.flatMap((run) =>
+      run.results.map((x) => `| ${run.mode} | ${x.ef} | ${x.recall.toFixed(4)} | ${Math.round(x.qps).toLocaleString()} | ${x.visitedAvg.toFixed(1)} |`),
+    ),
     `| brute force | — | 1.0000 | ${Math.round(bruteQps).toLocaleString()} | ${cfg.n.toLocaleString()} |`,
     '',
-    `build: f32 ${(f32.buildMs / 1000).toFixed(2)}s · sq8 ${(sq8.buildMs / 1000).toFixed(2)}s (incl. calibration)`,
-    `vector storage: f32 ${f32.bytesPerVector} B/vec · sq8 ${sq8.bytesPerVector} B/vec · ${(f32.bytesPerVector / sq8.bytesPerVector).toFixed(1)}× smaller`,
+    `build: ${runs.map((r) => `${r.mode} ${(r.buildMs / 1000).toFixed(2)}s`).join(' · ')}`,
+    `vector storage: ${runs.map((r) => `${r.mode} ${r.bytesPerVector} B/vec`).join(' · ')} · f32/sq8 = ${(runs[0]!.bytesPerVector / runs[1]!.bytesPerVector).toFixed(1)}× · f32/sq4 = ${(runs[0]!.bytesPerVector / runs[2]!.bytesPerVector).toFixed(1)}×`,
   ];
   console.log(lines.join('\n'));
 
   if (assertMode) {
-    const f64 = f32.results.find((x) => x.ef === 64)!;
-    const s64 = sq8.results.find((x) => x.ef === 64)!;
     let ok = true;
-    if (f64.recall < 0.95) {
-      console.error(`FAIL: f32 recall@10 @ef64 = ${f64.recall.toFixed(4)} < 0.95`);
-      ok = false;
-    } else {
-      console.log(`OK: f32 recall@10 @ef64 = ${f64.recall.toFixed(4)} ≥ 0.95`);
-    }
-    if (s64.recall < 0.9) {
-      console.error(`FAIL: sq8 recall@10 @ef64 = ${s64.recall.toFixed(4)} < 0.90`);
-      ok = false;
-    } else {
-      console.log(`OK: sq8 recall@10 @ef64 = ${s64.recall.toFixed(4)} ≥ 0.90`);
+    const gates: [Mode, number, number][] = [
+      ['f32', 0.95, 64],
+      ['sq8', 0.9, 64],
+      ['sq4', 0.5, 64],
+    ];
+    for (const [mode, floor, ef] of gates) {
+      const run = runs.find((r) => r.mode === mode)!;
+      const at = run.results.find((x) => x.ef === ef)!;
+      if (at.recall < floor) {
+        console.error(`FAIL: ${mode} recall@10 @ef${ef} = ${at.recall.toFixed(4)} < ${floor}`);
+        ok = false;
+      } else {
+        console.log(`OK: ${mode} recall@10 @ef${ef} = ${at.recall.toFixed(4)} ≥ ${floor}`);
+      }
     }
     if (!ok) process.exit(1);
   }

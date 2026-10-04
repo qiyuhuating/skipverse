@@ -18,7 +18,7 @@ const MAX_LEVEL = 32;
 const METRIC_CODE: Record<Metric, number> = { euclidean: 0, cosine: 1, dot: 2 };
 const METRIC_BY_CODE: Metric[] = ['euclidean', 'cosine', 'dot'];
 
-export type Quantization = 'none' | 'sq8';
+export type Quantization = 'none' | 'sq4' | 'sq8';
 /**
  * per-node scalars derived from the u8 codes + calibration (never serialized —
  * recomputed on load): cosine/dot need `dotC`/`norm` for the symmetric
@@ -46,16 +46,18 @@ interface Cand {
   d: number;
 }
 
-/** calibration: per-dimension affine map f32 → u8, frozen at `calibrate()` time */
+/** calibration: per-dimension affine map f32 → codes, frozen at `calibrate()` time */
 export interface Calibration {
   min: Float32Array;
   max: Float32Array;
-  /** step_d = (max_d − min_d) / 255 */
+  /** step_d = (max_d − min_d) / levels */
   step: Float32Array;
   /** c_d = step_d · min_d (cosine/dot expansion term) */
   c: Float32Array;
   /** Σ min_d² (cosine/dot expansion constant) */
   k: number;
+  /** max code value: 255 for sq8, 15 for sq4 */
+  levels: number;
 }
 
 /**
@@ -81,7 +83,7 @@ export interface HnswParams {
   efConstruction?: number;
   /** salt for layer-assignment RNG; same seed + same op order ⇒ identical graph */
   seed?: number;
-  /** 'sq8' stores 1 byte per dimension after `calibrate()` (default 'none') */
+  /** 'sq8' = 1 byte/dim, 'sq4' = 4 bits/dim packed, after `calibrate()` (default 'none') */
   quantization?: Quantization;
 }
 
@@ -142,8 +144,8 @@ export class HnswIndex {
     if (!Number.isInteger(efConstruction) || efConstruction < 1) {
       throw new Error(`efConstruction must be an integer ≥ 1, got ${efConstruction}`);
     }
-    if (quantization !== 'none' && quantization !== 'sq8') {
-      throw new Error(`quantization must be "none" or "sq8", got ${quantization}`);
+    if (quantization !== 'none' && quantization !== 'sq4' && quantization !== 'sq8') {
+      throw new Error(`quantization must be "none", "sq4" or "sq8", got ${quantization}`);
     }
     this.dim = dim;
     this.metric = metric;
@@ -170,7 +172,8 @@ export class HnswIndex {
 
   /** bytes a stored vector occupies (excluding graph links) — one byte per dimension */
   get bytesPerVector(): number {
-    return this.calibration !== null ? this.dim : this.dim * 4;
+    if (this.calibration === null) return this.dim * 4;
+    return this.quantization === 'sq4' ? Math.ceil(this.dim / 2) : this.dim;
   }
 
   /**
@@ -179,11 +182,12 @@ export class HnswIndex {
    * ranges (clamped) — the "train once, serve" model used by faiss/hnswlib.
    */
   calibrate(): void {
-    if (this.quantization !== 'sq8') throw new Error('calibrate() requires quantization: "sq8"');
+    if (this.quantization === 'none') throw new Error('calibrate() requires quantization: "sq4" or "sq8"');
     if (this.calibration !== null) throw new Error('index is already calibrated');
     if (this.nodes.length === 0) throw new Error('cannot calibrate an empty index');
 
     const { dim } = this;
+    const levels = this.quantization === 'sq4' ? 15 : 255;
     const min = new Float32Array(dim).fill(Infinity);
     const max = new Float32Array(dim).fill(-Infinity);
     for (const node of this.nodes) {
@@ -199,18 +203,18 @@ export class HnswIndex {
     let k = 0;
     for (let d = 0; d < dim; d++) {
       if (!(max[d]! > min[d]!)) max[d] = min[d]! + 1e-6; // degenerate dimension
-      step[d] = (max[d]! - min[d]!) / 255;
+      step[d] = (max[d]! - min[d]!) / levels;
       c[d] = step[d]! * min[d]!;
       k += min[d]! * min[d]!;
     }
-    this.calibration = { min, max, step, c, k };
-    this.distQ = this.metric === 'euclidean' ? distQEuclidean(this.calibration) : distQIp(this.calibration, this.metric === 'cosine');
-    this.distAdc = this.metric === 'euclidean' ? distQAdcEuclidean(this.calibration) : null;
+    this.calibration = { min, max, step, c, k, levels };
+    const packed = this.quantization === 'sq4';
+    this.distQ = this.metric === 'euclidean' ? distQEuclidean(this.calibration, packed) : distQIp(this.calibration, this.metric === 'cosine', packed);
+    this.distAdc = this.metric === 'euclidean' ? distQAdcEuclidean(this.calibration, packed) : null;
 
     for (const node of this.nodes) {
-      const u8 = this.quantizeToU8(node.vec as Float32Array);
-      node.vec = u8;
-      node.aux = this.auxOf(u8);
+      node.vec = this.quantizeStored(node.vec as Float32Array);
+      node.aux = this.auxOf(node.vec as Uint8Array);
     }
   }
 
@@ -226,7 +230,7 @@ export class HnswIndex {
     if (this.calibration === null) {
       this.insertPrepared(id, f, null);
     } else {
-      const u8 = this.quantizeToU8(f);
+      const u8 = this.quantizeStored(f);
       this.insertPrepared(id, u8, this.auxOf(u8), f);
     }
   }
@@ -421,26 +425,35 @@ export class HnswIndex {
 
   // ------------------------------------------------------------------ kernel
 
-  private quantizeToU8(v: Float32Array): Uint8Array {
+  private quantizeStored(v: Float32Array): Uint8Array {
     const cal = this.calibration!;
-    const out = new Uint8Array(this.dim);
+    const packed = this.quantization === 'sq4';
+    const out = new Uint8Array(packed ? Math.ceil(this.dim / 2) : this.dim);
     for (let d = 0; d < this.dim; d++) {
-      const x = v[d]!;
-      const q = Math.round((x - cal.min[d]!) / cal.step[d]!);
-      out[d] = q < 0 ? 0 : q > 255 ? 255 : q;
+      let q = Math.round((v[d]! - cal.min[d]!) / cal.step[d]!);
+      if (q < 0) q = 0;
+      else if (q > cal.levels) q = cal.levels;
+      if (packed) {
+        if ((d & 1) === 0) out[d >> 1] = q;
+        else out[d >> 1]! |= q << 4;
+      } else {
+        out[d] = q;
+      }
     }
     return out;
   }
 
+
   /** dequantized aux scalars, fully derivable from codes + calibration */
-  private auxOf(u8: Uint8Array): Aux {
+  private auxOf(buf: Uint8Array): Aux {
     const cal = this.calibration!;
+    const packed = this.quantization === 'sq4';
     let dotC = 0;
     let norm2 = 0;
     let selfW = 0;
     let xsm = 0;
     for (let d = 0; d < this.dim; d++) {
-      const q = u8[d]!;
+      const q = decodeCode(buf, d, packed);
       const v = q * cal.step[d]! + cal.min[d]!;
       dotC += q * cal.c[d]!;
       norm2 += v * v;
@@ -468,10 +481,13 @@ export class HnswIndex {
     return { vec: f, aux: null, qs, qm, q2 };
   }
 
-  private dequantize(u8: Uint8Array): Float32Array {
+  private dequantize(buf: Uint8Array): Float32Array {
     const cal = this.calibration!;
+    const packed = this.quantization === 'sq4';
     const out = new Float32Array(this.dim);
-    for (let d = 0; d < this.dim; d++) out[d] = u8[d]! * cal.step[d]! + cal.min[d]!;
+    for (let d = 0; d < this.dim; d++) {
+      out[d] = decodeCode(buf, d, packed) * cal.step[d]! + cal.min[d]!;
+    }
     return out;
   }
 
@@ -483,7 +499,7 @@ export class HnswIndex {
     }
     const f = prepareVector(query, this.metric, this.dim);
     if (this.metric === 'euclidean') return this.adcQuery(f);
-    const u8 = this.quantizeToU8(f);
+    const u8 = this.quantizeStored(f);
     return { vec: u8, aux: this.auxOf(u8) };
   }
 
@@ -614,12 +630,13 @@ export class HnswIndex {
 
   /** adopt an already-computed calibration (compaction path); rewrites nothing */
   private adoptCalibration(cal: Calibration): void {
-    if (this.quantization !== 'sq8') throw new Error('adoptCalibration requires quantization: "sq8"');
+    if (this.quantization === 'none') throw new Error('adoptCalibration requires quantization: "sq4" or "sq8"');
     if (this.calibration !== null) throw new Error('index is already calibrated');
     if (cal.min.length !== this.dim) throw new Error('calibration dim mismatch');
     this.calibration = cal;
-    this.distQ = this.metric === 'euclidean' ? distQEuclidean(cal) : distQIp(cal, this.metric === 'cosine');
-    this.distAdc = this.metric === 'euclidean' ? distQAdcEuclidean(cal) : null;
+    const packed = this.quantization === 'sq4';
+    this.distQ = this.metric === 'euclidean' ? distQEuclidean(cal, packed) : distQIp(cal, this.metric === 'cosine', packed);
+    this.distAdc = this.metric === 'euclidean' ? distQAdcEuclidean(cal, packed) : null;
   }
 
   // ------------------------------------------------------------- persistence
@@ -634,7 +651,7 @@ export class HnswIndex {
     w.u32(this.efConstruction);
     w.u32(this.seed);
     const cal = this.calibration;
-    w.u8(cal !== null ? 2 : this.quantization === 'sq8' ? 1 : 0); // 0 f32 · 1 sq8-uncalibrated · 2 sq8-calibrated
+    w.u8(cal !== null ? (this.quantization === 'sq4' ? 4 : 2) : this.quantization === 'sq4' ? 3 : this.quantization === 'sq8' ? 1 : 0); // 0 f32 · 1 sq8-uncal · 2 sq8-cal · 3 sq4-uncal · 4 sq4-cal
     if (cal !== null) {
       for (let d = 0; d < this.dim; d++) w.f32(cal.min[d]!).f32(cal.max[d]!);
     }
@@ -647,7 +664,8 @@ export class HnswIndex {
       w.u8(node.deleted ? 1 : 0);
       if (cal !== null) {
         const v = node.vec as Uint8Array;
-        for (let i = 0; i < this.dim; i++) w.u8(v[i]!);
+        const n = this.quantization === 'sq4' ? (this.dim + 1) >> 1 : this.dim;
+        for (let i = 0; i < n; i++) w.u8(v[i]!);
       } else {
         const v = node.vec as Float32Array;
         for (let i = 0; i < this.dim; i++) w.f32(v[i]!);
@@ -675,15 +693,16 @@ export class HnswIndex {
     const efConstruction = r.u32();
     const seed = r.u32();
     const quantCode = version >= 2 ? r.u8() : 0;
+    const calibrated = quantCode === 2 || quantCode === 4;
     const idx = new HnswIndex({
       dim,
       metric,
       M,
       efConstruction,
       seed,
-      quantization: quantCode === 0 ? 'none' : 'sq8',
+      quantization: quantCode === 0 ? 'none' : quantCode <= 2 ? 'sq8' : 'sq4',
     });
-    if (quantCode === 2) {
+    if (quantCode === 2 || quantCode === 4) {
       const min = new Float32Array(dim);
       const max = new Float32Array(dim);
       for (let d = 0; d < dim; d++) {
@@ -694,12 +713,14 @@ export class HnswIndex {
       const c = new Float32Array(dim);
       let k = 0;
       for (let d = 0; d < dim; d++) {
-        step[d] = (max[d]! - min[d]!) / 255;
+        step[d] = (max[d]! - min[d]!) / (quantCode === 4 ? 15 : 255);
         c[d] = step[d]! * min[d]!;
         k += min[d]! * min[d]!;
       }
-      idx.calibration = { min, max, step, c, k };
-      idx.distQ = metric === 'euclidean' ? distQEuclidean(idx.calibration) : distQIp(idx.calibration, metric === 'cosine');
+      idx.calibration = { min, max, step, c, k, levels: quantCode === 4 ? 15 : 255 };
+      const packed = quantCode === 4;
+      idx.distQ = metric === 'euclidean' ? distQEuclidean(idx.calibration, packed) : distQIp(idx.calibration, metric === 'cosine', packed);
+      idx.distAdc = metric === 'euclidean' ? distQAdcEuclidean(idx.calibration, packed) : null;
     }
     const count = r.u32();
     const entry = r.i32();
@@ -710,9 +731,10 @@ export class HnswIndex {
       const deleted = r.u8() === 1;
       if (level > MAX_LEVEL) throw new Error(`corrupt index: node level ${level} > ${MAX_LEVEL}`);
       let vec: Float32Array | Uint8Array;
-      if (quantCode === 2) {
-        const u8 = new Uint8Array(dim);
-        for (let j = 0; j < dim; j++) u8[j] = r.u8();
+      if (calibrated) {
+        const nbytes = quantCode === 4 ? (dim + 1) >> 1 : dim;
+        const u8 = new Uint8Array(nbytes);
+        for (let j = 0; j < nbytes; j++) u8[j] = r.u8();
         vec = u8;
       } else {
         const f = new Float32Array(dim);
@@ -739,7 +761,7 @@ export class HnswIndex {
       }
     }
     // aux scalars are pure functions of (codes, calibration) — rebuild, don't store
-    if (quantCode === 2) {
+    if (calibrated) {
       for (const node of idx.nodes) node.aux = idx.auxOf(node.vec as Uint8Array);
     }
     if (entry !== -1) {
@@ -754,12 +776,29 @@ export class HnswIndex {
   }
 }
 
+/** decode code for dimension d from a u8 layout or packed-nibble layout */
+function decodeCode(buf: Uint8Array, d: number, packed: boolean): number {
+  return packed ? (buf[d >> 1]! >> ((d & 1) << 2)) & 15 : buf[d]!;
+}
+
 // ------------------------------------------------------------ quantized kernels
 
-/** euclidean over u8 codes on both sides (node-node distances in ADC mode) */
-function distQEuclidean(cal: Calibration): (a: QVec, b: QVec) => number {
+/** euclidean over codes on both sides (node-node distances in ADC mode) */
+function distQEuclidean(cal: Calibration, packed: boolean): (a: QVec, b: QVec) => number {
   const { step, min } = cal;
   const dim = min.length;
+  if (packed) {
+    return (a, b) => {
+      const va = a.vec as Uint8Array;
+      const vb = b.vec as Uint8Array;
+      let s = 0;
+      for (let d = 0; d < dim; d++) {
+        const diff = decodeCode(va, d, true) - decodeCode(vb, d, true);
+        s += diff * diff * step[d]!;
+      }
+      return Math.sqrt(s);
+    };
+  }
   return (a, b) => {
     const va = a.vec as Uint8Array;
     const vb = b.vec as Uint8Array;
@@ -779,36 +818,48 @@ function distQEuclidean(cal: Calibration): (a: QVec, b: QVec) => number {
  *   v_a·v_b      = dot(qs, q_b) + qm          (qs = v_a⊙step, qm = Σ v_a·min)
  *   ‖v_b‖²       = selfW + 2·xsm + K          (per-node precomputed scalars)
  * so each pair costs one dim-loop plus three scalars, and the query's
- * quantization noise — half of the total in symmetric codes — disappears.
+ * quantization noise disappears entirely — only data-side noise remains.
  */
-function distQAdcEuclidean(cal: Calibration): (node: QVec, q: QVec) => number {
+function distQAdcEuclidean(cal: Calibration, packed: boolean): (node: QVec, q: QVec) => number {
   const { step, min, k } = cal;
   const dim = min.length;
   return (node, q) => {
     const qb = node.vec as Uint8Array;
     const qs = q.qs!;
     let dot = 0;
-    for (let d = 0; d < dim; d++) dot += qs[d]! * qb[d]!;
+    if (packed) {
+      for (let d = 0; d < dim; d++) dot += qs[d]! * decodeCode(qb, d, true);
+    } else {
+      for (let d = 0; d < dim; d++) dot += qs[d]! * qb[d]!;
+    }
     const d2 = q.q2! - 2 * (dot + q.qm!) + node.aux!.selfW + 2 * node.aux!.xsm + k;
     return Math.sqrt(Math.max(0, d2));
   };
 }
 
 /**
- * cosine / dot over u8 codes on both sides. With v = q·step + min:
+ * cosine / dot over codes on both sides. With v = q·step + min:
  *   v·v′ = q·W·q′ + c·q + c·q′ + K   (W = step²ᵈ, c = step·min, K = Σ min²)
  * Both sides carry `dotC = Σ c_d·q_d` and the dequantized L2 norm as
  * precomputed scalars, so the per-pair cost is one weighted dot plus three
  * scalars — no per-dimension affine work.
  */
-function distQIp(cal: Calibration, cosine: boolean): (a: QVec, b: QVec) => number {
+function distQIp(cal: Calibration, cosine: boolean, packed: boolean): (a: QVec, b: QVec) => number {
   const { step, k, min } = cal;
   const dim = min.length;
-  const wDot = (a: Uint8Array, b: Uint8Array): number => {
-    let s = 0;
-    for (let d = 0; d < dim; d++) s += a[d]! * b[d]! * step[d]! * step[d]!;
-    return s;
-  };
+  const wDot = packed
+    ? (a: Uint8Array, b: Uint8Array): number => {
+        let s = 0;
+        for (let d = 0; d < dim; d++) {
+          s += decodeCode(a, d, true) * decodeCode(b, d, true) * step[d]! * step[d]!;
+        }
+        return s;
+      }
+    : (a: Uint8Array, b: Uint8Array): number => {
+        let s = 0;
+        for (let d = 0; d < dim; d++) s += a[d]! * b[d]! * step[d]! * step[d]!;
+        return s;
+      };
   return (a, b) => {
     const ip = wDot(a.vec as Uint8Array, b.vec as Uint8Array) + a.aux!.dotC + b.aux!.dotC + k;
     if (!cosine) return -ip;

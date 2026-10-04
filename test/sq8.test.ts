@@ -34,6 +34,37 @@ describe('SQ8 scalar quantization', () => {
     assert.ok(r >= 0.85, `sq8 cosine recall@10 @ef64 = ${r.toFixed(3)}, want ≥ 0.85`);
   });
 
+  it('sq4 trades bytes hard: 8× smaller, recall ≥ 0.60 on clustered euclidean', () => {
+    const { vecs, queries } = genClusterData(3000, 16, 25, 7);
+    const idx = new HnswIndex({ dim: 16, metric: 'euclidean', quantization: 'sq4', M: 12, efConstruction: 150, seed: 5 });
+    for (let i = 0; i < vecs.length; i++) idx.add(String(i), vecs[i]!);
+    idx.calibrate();
+    assert.equal(idx.bytesPerVector, 8, '16 dims packed as nibbles = 8 bytes');
+    let sum = 0;
+    for (const q of queries.slice(0, 50)) {
+      sum += recall(bruteForce(vecs, q, 10, 'euclidean'), idx.search(q, 10, { ef: 128 }));
+    }
+    const r = sum / 50;
+    assert.ok(r >= 0.6, `sq4 recall@10 @ef128 = ${r.toFixed(3)}, want ≥ 0.60`);
+    // the serialized form must be search-identical to the in-memory graph
+    const round = HnswIndex.deserialize(idx.serialize());
+    const q = queries[3]!;
+    assert.deepEqual(round.search(q, 10, { ef: 128 }), idx.search(q, 10, { ef: 128 }));
+    assert.ok(round.isCalibrated);
+  });
+
+  it('sq4 works for cosine too and round-trips exactly', () => {
+    const { vecs, queries } = genClusterData(600, 12, 8, 41);
+    const idx = new HnswIndex({ dim: 12, metric: 'cosine', quantization: 'sq4', M: 10, efConstruction: 120, seed: 6 });
+    for (let i = 0; i < vecs.length; i++) idx.add(String(i), vecs[i]!);
+    idx.calibrate();
+    assert.equal(idx.bytesPerVector, 6);
+    const q = queries[0]!;
+    const before = idx.search(q, 5, { ef: 96 });
+    const round = HnswIndex.deserialize(idx.serialize());
+    assert.deepEqual(round.search(q, 5, { ef: 96 }), before);
+  });
+
   it('shrinks vector storage 4× (links dominate the file, vectors do not)', () => {
     const { vecs } = genClusterData(600, 32, 8, 11);
     const plain = new HnswIndex({ dim: 32, metric: 'euclidean', quantization: 'sq8', seed: 1 });

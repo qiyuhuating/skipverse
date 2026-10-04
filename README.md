@@ -105,9 +105,12 @@ stored vector becomes one byte per dimension (4× smaller); distances then run i
 ```ts
 const idx = new HnswIndex({ dim: 64, metric: "euclidean", quantization: "sq8" });
 // ... add() your corpus in f32 ...
-idx.calibrate();     // freezes per-dimension [min,max], rewrites vectors as u8 — one-shot
+idx.calibrate();     // freezes per-dimension [min,max], rewrites vectors as codes — one-shot
 idx.add("new-doc", vec);   // later inserts are quantized through the frozen ranges
 ```
+
+`quantization: "sq4"` packs the same affine map into 4-bit nibbles (8× smaller, noticeably lossy — see the honest
+benchmark below).
 
 Under the hood the quantized kernels do real math, not byte-tricks. For **euclidean**, search uses *asymmetric
 distance computation*: the query stays exact f32 (reduced to `v⊙step`, `v·min`, `‖v‖²`) and each pair costs one
@@ -181,25 +184,32 @@ Deterministic, seeded, reproducible (`npm run bench`):
 
 | mode | efSearch | recall@10 | QPS | avg nodes visited |
 |:-----|---------:|----------:|----:|------------------:|
-| f32 | 16 | 0.9650 | 13,696 | 288.9 |
-| f32 | 64 | 1.0000 | 5,855 | 501.9 |
-| f32 | 128 | 1.0000 | 3,562 | 571.1 |
-| sq8 (ADC) | 16 | 0.9400 | 12,197 | 288.1 |
-| sq8 (ADC) | 64 | 0.9720 | 5,078 | 502.1 |
-| sq8 (ADC) | 128 | 0.9720 | 3,331 | 570.9 |
-| brute force | — | 1.0000 | 420 | 10,000 |
+| f32 | 16 | 0.9650 | 11,270 | 288.9 |
+| f32 | 64 | 1.0000 | 4,344 | 501.9 |
+| f32 | 128 | 1.0000 | 3,141 | 571.1 |
+| sq8 (ADC) | 16 | 0.9400 | 11,715 | 288.1 |
+| sq8 (ADC) | 64 | 0.9720 | 5,069 | 502.1 |
+| sq8 (ADC) | 128 | 0.9720 | 3,185 | 570.9 |
+| sq4 (ADC) | 16 | 0.5990 | 8,277 | 296.5 |
+| sq4 (ADC) | 64 | 0.5890 | 3,112 | 504.6 |
+| sq4 (ADC) | 128 | 0.5880 | 2,163 | 574.0 |
+| brute force | — | 1.0000 | 312 | 10,000 |
 
-build: f32 3.26s · sq8 3.39s (incl. calibration) · vector storage: f32 256 B/vec → sq8 64 B/vec (**4.0× smaller**).
+build: f32 3.42s · sq8 3.40s · sq4 4.51s · vector storage: 256 → 64 → **32 B/vec** (4× / 8×).
 
-Reading the table honestly: at ef=64 the f32 index is **~15× brute force at identical recall** (32× at ef=16).
+Reading the table honestly: at ef=64 the f32 index is **~14× brute force at identical recall** (36× at ef=16).
 Queries are in-distribution (data point + N(0, 0.3) noise) — deliberately off-manifold queries are the known weak
 spot of greedy graph search, in this implementation and every other.
 
-SQ8 trades a little accuracy for a lot of footprint: **4× smaller vectors at ~87% of the f32 QPS and −2.8 recall
-points** at ef=64. The win comes from asymmetric distance computation — the query stays full-precision f32 and only
-the stored side is a u8 code, which removes half the quantization noise (symmetric codes scored 0.864 on this
-dataset before ADC; the residual plateau at 0.972 is the data-side noise). Tight gaussian blobs produce many
-near-tie distances, exactly where 8-bit codes hurt most; spread-out distributions lose even less.
+**SQ8 is the sweet spot**: 4× smaller vectors at ~117% of the f32 QPS and −2.8 recall points at ef=64. The win comes
+from asymmetric distance computation — the query stays full-precision f32 and only the stored side is a u8 code,
+which removes half the quantization noise (symmetric codes scored 0.864 on this dataset before ADC; the residual
+plateau at 0.972 is the data-side noise).
+
+**SQ4 is the extreme tier**: 8× smaller at ~0.59 recall on this dataset — 16 levels per dimension is inherently
+lossy, and this clustered geometry is full of near-tie distances that 4-bit codes cannot separate (spread-out
+distributions lose far less). Treat it as a coarse-filter stage or a memory-last resort; rescoring with original
+vectors is the natural next layer and lives on the roadmap.
 
 ## Zero dependencies
 
@@ -209,14 +219,15 @@ should not include 200 transitive packages, and the algorithm is the product.
 
 ## Acceptance criteria (enforced by CI)
 
-- 35+ tests green on Node 22 & 24 — including recall floors (f32 and sq8), degree-cap invariants, filtered-search
-  semantics, WAL torn-write recovery, snapshot+WAL round-trips, compaction, and a full HTTP restart cycle;
+- 48 tests green on Node 22 & 24 — including recall floors for f32/sq8/sq4, degree-cap invariants, filtered-search
+  semantics, WAL torn-write recovery, snapshot+WAL round-trips, compaction, a full HTTP restart cycle, and a
+  2,500-op seeded fuzz run where a brute-force mirror model must agree with the store at every step;
 - typecheck strict, `verbatimModuleSyntax`, no `any` in the engine;
-- the CI benchmark run must hold **f32 recall@10 ≥ 0.95 and sq8 recall@10 ≥ 0.90 at ef=64** or the build fails.
+- the CI benchmark run must hold **f32 ≥ 0.95, sq8 ≥ 0.90, sq4 ≥ 0.50 recall@10 at ef=64** or the build fails.
 
 ## Roadmap
 
-- [ ] SQ4/PQ residual refinement for memory-bound fleets
+- [ ] PQ / residual codes on top of SQ4 (two-stage rerank to recover low-bit recall)
 - [ ] online recalibration when the data distribution drifts
 - [ ] concurrent readers (copy-on-write snapshot reads)
 - [ ] memory-mapped snapshot loader (zero-copy warm start)
