@@ -114,6 +114,34 @@ describe('VectorStore', () => {
     }
   });
 
+  it('carries quantization through the store lifecycle (sq8 persisted + reopened)', () => {
+    const dir = tmpDir();
+    const ds = genClusterData(120, 16, 8, 27);
+    let results: unknown;
+    {
+      const store = VectorStore.open({ dataDir: dir, dim: 16, metric: 'euclidean', M: 8, quantization: 'sq8' });
+      insert(store, ds, 0, 120);
+      store.calibrate(); // quantize + snapshot rotation
+      assert.ok(store.index.isCalibrated);
+      assert.equal(store.index.bytesPerVector, 16);
+      assert.throws(() => store.index.calibrate(), /already calibrated/);
+      results = store.search(ds.queries[0]!, 5, { ef: 64 });
+      store.close();
+    }
+    {
+      const store = VectorStore.open({ dataDir: dir, dim: 16, metric: 'euclidean', M: 8, quantization: 'sq8' });
+      assert.ok(store.index.isCalibrated, 'calibration survives snapshot reload');
+      assert.deepEqual(store.search(ds.queries[0]!, 5, { ef: 64 }), results);
+      store.upsert('post', ds.vecs[0]!); // post-calibration inserts through frozen ranges
+      assert.equal(store.index.size, 121);
+      store.close();
+    }
+    assert.throws(
+      () => VectorStore.open({ dataDir: dir, dim: 16, quantization: 'sq4' }),
+      /quantization/,
+    );
+  });
+
   it('refuses a dim mismatch and validates the meta file', () => {
     const dir = tmpDir();
     const store = VectorStore.open({ dataDir: dir, dim: 16 });

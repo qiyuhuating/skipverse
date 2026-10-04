@@ -5,9 +5,11 @@
 - **SQ4 scalar quantization**: `quantization: "sq4"` packs 4-bit codes (two dimensions per byte, 8× smaller than
   f32) behind the same one-shot `calibrate()` flow. All three metric kernels are nibble-aware; euclidean keeps ADC.
   Benchmarked honestly: 8× memory at ~0.59 recall@10 on tight 64d clusters — coarse-stage material.
+- **Quantization goes full-stack**: `VectorStore` accepts `quantization`, persists it in meta.json (with conflict
+  validation), and gains `store.calibrate()`; the CLI grows `--quantization sq8|sq4` and a `skipverse calibrate`
+  subcommand.
 - **Seeded fuzz test**: 2,500 mixed upsert/delete/search/checkpoint ops against a brute-force mirror model that must
-  agree after every search, plus randomized serialize/deserialize churn across metrics and dims. Found (and this
-  release fixes) tombstone-accounting assumptions in the test itself — the store semantics are now pinned.
+  agree after every search, plus randomized serialize/deserialize churn across metrics and dims.
 - CI benchmark gates extended: f32 ≥ 0.95, sq8 ≥ 0.90, sq4 ≥ 0.50 recall@10 @ef64.
 
 ## 0.2.0 — 2026-10-04

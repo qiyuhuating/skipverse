@@ -18,6 +18,8 @@ export interface StoreOptions {
   M?: number;
   efConstruction?: number;
   seed?: number;
+  /** scalar quantization for the stored index: 'sq8' (4× smaller) or 'sq4' (8×, lossy) */
+  quantization?: 'sq8' | 'sq4';
   /** auto-checkpoint after this many WAL ops; 0 disables (default 4096) */
   checkpointEvery?: number;
 }
@@ -35,6 +37,7 @@ interface Meta {
   M: number;
   efConstruction: number;
   seed: number;
+  quantization: 'none' | 'sq8' | 'sq4';
 }
 
 /**
@@ -65,6 +68,7 @@ export class VectorStore {
       M: meta.M,
       efConstruction: meta.efConstruction,
       seed: meta.seed,
+      quantization: meta.quantization,
     });
     this.walPath = path.join(opts.dataDir, WAL_FILE);
     this.snapshotPath = path.join(opts.dataDir, SNAPSHOT_FILE);
@@ -109,6 +113,9 @@ export class VectorStore {
       }
       const conflicts: string[] = [];
       if (opts.metric && opts.metric !== meta.metric) conflicts.push(`metric ${meta.metric} → ${opts.metric}`);
+      if (opts.quantization && opts.quantization !== meta.quantization) {
+        conflicts.push(`quantization ${meta.quantization} → ${opts.quantization}`);
+      }
       if (opts.M && opts.M !== meta.M) conflicts.push(`M ${meta.M} → ${opts.M}`);
       if (opts.efConstruction && opts.efConstruction !== meta.efConstruction) {
         conflicts.push(`efConstruction ${meta.efConstruction} → ${opts.efConstruction}`);
@@ -122,6 +129,7 @@ export class VectorStore {
         M: opts.M ?? 16,
         efConstruction: opts.efConstruction ?? 200,
         seed: opts.seed ?? 0x5356,
+        quantization: opts.quantization ?? 'none',
       };
       fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
     }
@@ -159,6 +167,12 @@ export class VectorStore {
       walBytes: this.opsSinceCheckpoint === 0 ? 0 : fs.statSync(this.walPath).size,
       walOpsSinceCheckpoint: this.opsSinceCheckpoint,
     };
+  }
+
+  /** Calibrate the underlying quantized index (see HnswIndex.calibrate) and rotate a snapshot. */
+  calibrate(): void {
+    this.index.calibrate();
+    this.checkpoint();
   }
 
   /** Write a snapshot (atomic rename), then truncate the WAL. */

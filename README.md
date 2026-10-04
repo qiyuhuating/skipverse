@@ -53,10 +53,11 @@ const hits = idx.search(query, 10, { ef: 64 });
 ```ts
 import { VectorStore } from "skipverse";
 
-const store = VectorStore.open({ dataDir: "./data", dim: 64, metric: "cosine" });
+const store = VectorStore.open({ dataDir: "./data", dim: 64, metric: "cosine", quantization: "sq8" });
 store.upsert("doc-1", embedding);        // appended to CRC-framed WAL, auto-checkpointed
+store.calibrate();                       // freeze ranges + rewrite codes + rotate snapshot
 store.remove("doc-2");                   // soft delete: filtered from results, kept as graph anchor
-store.checkpoint();                      // atomic snapshot + WAL truncation
+store.compact();                         // rebuild from alive vectors, reclaim tombstone space
 // kill -9 at any point: reopen replays the WAL, torn tails are truncated at frame boundaries
 ```
 

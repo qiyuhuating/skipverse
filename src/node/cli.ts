@@ -21,7 +21,9 @@ function storeOptionsFrom(flags: { data?: string; dim?: string; metric?: string;
 const USAGE = `skipverse — a from-scratch vector database (HNSW, zero deps)
 
   skipverse serve   --port 8787 --data ./data --dim 64 --metric cosine
-                    [--M 16] [--ef-construction 200]
+                    [--M 16] [--ef-construction 200] [--quantization sq8|sq4]
+  skipverse calibrate --data ./data --dim 64
+                    (freeze ranges + rewrite codes on a quantized store)
   skipverse import  --file vectors.jsonl --data ./data --dim 64
                     (JSONL: {"id": "...", "vec": [...]})
   skipverse help
@@ -53,6 +55,23 @@ async function main(): Promise<void> {
       console.log(`  api    ${url}/search  POST {vec, k, ef}`);
       console.log(`  demo   ${url}/`);
       console.log(`  data   ${so.dataDir}`);
+      break;
+    }
+    case 'calibrate': {
+      const so = storeOptionsFrom({
+        data: flag(argv, '--data'),
+        dim: flag(argv, '--dim'),
+        metric: flag(argv, '--metric'),
+        M: flag(argv, '--M'),
+        ef: flag(argv, '--ef-construction'),
+      });
+      const store = VectorStore.open(so);
+      const t0 = performance.now();
+      store.calibrate();
+      store.close();
+      console.log(
+        `calibrated ${store.index.size} vectors in ${Math.round(performance.now() - t0)}ms → ${store.index.bytesPerVector} B/vec`,
+      );
       break;
     }
     case 'import': {
