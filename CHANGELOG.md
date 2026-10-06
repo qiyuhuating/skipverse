@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — 2026-10-04
+## 0.3.0 — 2026-10-06
 
 - **SQ4 scalar quantization**: `quantization: "sq4"` packs 4-bit codes (two dimensions per byte, 8× smaller than
   f32) behind the same one-shot `calibrate()` flow. All three metric kernels are nibble-aware; euclidean keeps ADC.
