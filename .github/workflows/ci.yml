@@ -22,5 +22,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run bench:ci
+      - run: npm run example
       - run: npm run build
       - run: npm run demo:build

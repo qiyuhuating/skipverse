@@ -55,6 +55,11 @@ async function main(): Promise<void> {
       console.log(`  api    ${url}/search  POST {vec, k, ef}`);
       console.log(`  demo   ${url}/`);
       console.log(`  data   ${so.dataDir}`);
+      process.on('SIGINT', () => {
+        console.log('\nshutting down (checkpoint=false — WAL has everything)');
+        store.close();
+        process.exit(0);
+      });
       break;
     }
     case 'calibrate': {
@@ -87,14 +92,20 @@ async function main(): Promise<void> {
       const store = VectorStore.open(so);
       const t0 = performance.now();
       let n = 0;
+      let batch: { id: string; vec: number[] }[] = [];
+      const flush = () => {
+        store.upsertBatch(batch);
+        n += batch.length;
+        batch = [];
+      };
       const lines = fs.readFileSync(file, 'utf8').split('\n');
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.length === 0) continue;
-        const { id, vec } = JSON.parse(trimmed) as { id: string; vec: number[] };
-        store.upsert(id, vec);
-        n++;
+        batch.push(JSON.parse(trimmed) as { id: string; vec: number[] });
+        if (batch.length >= 500) flush();
       }
+      if (batch.length > 0) flush();
       store.checkpoint();
       store.close();
       const ms = Math.round(performance.now() - t0);

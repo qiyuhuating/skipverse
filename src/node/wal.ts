@@ -127,3 +127,23 @@ export function appendWal(fd: number, op: WalOp, dim: number): void {
   frame.set(payload, 8);
   fs.writeSync(fd, frame);
 }
+
+/** Append many framed ops in a single write syscall (bulk import path). */
+export function appendWalBatch(fd: number, ops: WalOp[], dim: number): void {
+  if (ops.length === 0) return;
+  const frames = ops.map((op) => {
+    const payload = encodeWalOp(op, dim);
+    return { payload, len: payload.length };
+  });
+  const total = frames.reduce((n, f) => n + 8 + f.len, 0);
+  const buf = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (const { payload, len } of frames) {
+    const view = new DataView(buf.buffer, buf.byteOffset + off, len + 8);
+    view.setUint32(0, len, true);
+    view.setUint32(4, crc32(payload), true);
+    buf.set(payload, off + 8);
+    off += 8 + len;
+  }
+  fs.writeSync(fd, buf);
+}

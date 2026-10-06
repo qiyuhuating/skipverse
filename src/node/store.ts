@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { HnswIndex, type TracedSearch } from '../core/hnsw.js';
 import { prepareVector } from '../core/distance.js';
 import type { IndexStats, Metric, SearchOptions, SearchResult } from '../core/types.js';
-import { appendWal, loadWal } from './wal.js';
+import { appendWal, appendWalBatch, loadWal } from './wal.js';
 
 const META_FILE = 'meta.json';
 const SNAPSHOT_FILE = 'snapshot.bin';
@@ -187,7 +187,24 @@ export class VectorStore {
   }
 
   upsertBatch(entries: { id: string; vec: ArrayLike<number> }[]): void {
-    for (const e of entries) this.upsert(e.id, e.vec);
+    if (entries.length === 0) return;
+    // validate everything first so a bad vector can't half-apply the batch
+    const prepared = entries.map((e) => ({
+      id: e.id,
+      vec: prepareVector(e.vec, this.index.metric, this.index.dim),
+    }));
+    const ops: Parameters<typeof appendWal>[1][] = [];
+    for (const { id, vec } of prepared) {
+      this.index.add(id, vec);
+      this.walSeq++;
+      ops.push({ seq: this.walSeq, kind: 'upsert' as const, id, vec });
+    }
+    appendWalBatch(this.walFd, ops, this.index.dim);
+    if (this.fsync) fs.fsyncSync(this.walFd);
+    this.opsSinceCheckpoint += ops.length;
+    if (this.checkpointEvery > 0 && this.opsSinceCheckpoint >= this.checkpointEvery) {
+      this.checkpoint();
+    }
   }
 
   remove(id: string): boolean {

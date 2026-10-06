@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 — 2026-10-06
+
+- **Batched WAL writes**: `upsertBatch` validates all vectors, applies them, and flushes the whole batch in a single
+  write syscall — under `fsync: true` that means one fsync per batch instead of one per vector.
+- `skipverse serve` now shuts down gracefully on SIGINT (lock released, no stale-lock warning on next start).
+- CI runs the quickstart example as a gate.
+
 ## 0.3.1 — 2026-10-06
 
 - **2× hot-path optimization**: searchLayer now uses a numeric (dist, handle) binary heap with zero per-element
