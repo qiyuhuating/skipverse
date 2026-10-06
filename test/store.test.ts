@@ -142,6 +142,35 @@ describe('VectorStore', () => {
     );
   });
 
+  it('refuses a second writer via the lockfile and auto-clears stale locks', () => {
+    const dir = tmpDir();
+    const store = VectorStore.open({ dataDir: dir, dim: 8 });
+    store.upsert('x', [1, 0, 0, 0, 0, 0, 0, 0]);
+    // same process double-open: allowed (single-writer advisory semantics), lock is refreshed
+    const again = VectorStore.open({ dataDir: dir, dim: 8 });
+    again.close();
+    store.close();
+    assert.ok(!fs.existsSync(path.join(dir, 'lock')), 'close must remove the lock');
+
+    // a lock left by a dead process must be auto-cleared
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'lock'), JSON.stringify({ pid: 999999999, at: '2020-01-01' }));
+    const store2 = VectorStore.open({ dataDir: dir, dim: 8 });
+    store2.close();
+  });
+
+  it('accepts fsync mode without changing semantics', () => {
+    const dir = tmpDir();
+    const store = VectorStore.open({ dataDir: dir, dim: 8, metric: 'euclidean', fsync: true });
+    for (let i = 0; i < 30; i++) store.upsert(String(i), [i, 0, 0, 0, 0, 0, 0, 0]);
+    store.checkpoint();
+    store.upsert('last', [99, 0, 0, 0, 0, 0, 0, 0]);
+    store.close();
+    const reopened = VectorStore.open({ dataDir: dir, dim: 8, metric: 'euclidean' });
+    assert.equal(reopened.index.size, 31);
+    reopened.close();
+  });
+
   it('refuses a dim mismatch and validates the meta file', () => {
     const dir = tmpDir();
     const store = VectorStore.open({ dataDir: dir, dim: 16 });

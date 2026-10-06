@@ -1,6 +1,6 @@
 import { BufReader, BufWriter } from './binary.js';
 import { makeDistance, prepareVector, type DistanceFn } from './distance.js';
-import { MinHeap } from './heap.js';
+import { CandHeap } from './cand-heap.js';
 import { hashSeed, mulberry32 } from './rng.js';
 import type {
   IndexStats,
@@ -125,6 +125,9 @@ export class HnswIndex {
   private alive = 0;
   private deleted = 0;
   private calibration: Calibration | null = null;
+  /** generation-stamped visited marks for searchLayer — no Set allocations on the hot path */
+  private visitStamp: Uint32Array = new Uint32Array(1024);
+  private visitGen = 0;
 
   /** full-precision kernel (pre-calibration) */
   private distF32: DistanceFn;
@@ -390,6 +393,18 @@ export class HnswIndex {
     };
   }
 
+  /**
+   * The stored vector for an id: exact f32 before calibration, dequantized
+   * after (cosine indexes hold normalized vectors). Null when absent/deleted.
+   */
+  vector(id: string): Float32Array | null {
+    const h = this.idToHandle.get(id);
+    if (h === undefined || this.nodes[h]!.deleted) return null;
+    const node = this.nodes[h]!;
+    if (this.calibration !== null) return this.dequantize(node.vec as Uint8Array);
+    return Float32Array.from(node.vec as Float32Array);
+  }
+
   /** Per-level neighbor ids of a node — for visualization and introspection. */
   adjacency(id: string): string[][] | null {
     const h = this.idToHandle.get(id);
@@ -561,39 +576,47 @@ export class HnswIndex {
     hops?: { from: number; to: number; dist: number }[],
     filter?: (id: string) => boolean,
   ): { cands: Cand[]; visited: number } {
-    const visited = new Set<number>(eps);
-    const frontier = new MinHeap<Cand>((a, b) => a.d < b.d);
-    const best = new MinHeap<Cand>((a, b) => a.d > b.d); // max-heap on distance
+    if (this.visitStamp.length < this.nodes.length) {
+      this.visitStamp = new Uint32Array(this.nodes.length * 2);
+      this.visitGen = 0;
+    }
+    const stamp = ++this.visitGen;
+    const vis = this.visitStamp;
+    let visitedCount = 0;
+    const frontier = new CandHeap(false);
+    const best = new CandHeap(true); // max-heap on distance: root is the worst kept candidate
     for (const e of eps) {
+      vis[e] = stamp;
+      visitedCount++;
       const d = this.dist(e, q);
-      frontier.push({ h: e, d });
+      frontier.push(e, d);
       if ((filter === undefined || filter(this.nodes[e]!.id)) && !this.nodes[e]!.deleted) {
-        best.push({ h: e, d });
+        best.push(e, d);
       }
     }
     while (frontier.size > 0) {
-      const c = frontier.pop()!;
-      const worst = best.peek();
-      if (worst !== undefined && c.d > worst.d && best.size >= ef) break;
-      for (const nb of this.nodes[c.h]!.links[level] ?? []) {
-        if (visited.has(nb)) continue;
-        visited.add(nb);
+      const h = frontier.pop();
+      const d0 = frontier.poppedDist;
+      const worst = best.size > 0 ? best.peekDist() : Infinity;
+      if (d0 > worst && best.size >= ef) break;
+      for (const nb of this.nodes[h]!.links[level] ?? []) {
+        if (vis[nb] === stamp) continue;
+        vis[nb] = stamp;
+        visitedCount++;
         const d = this.dist(nb, q);
-        hops?.push({ from: c.h, to: nb, dist: d });
+        hops?.push({ from: h, to: nb, dist: d });
         const admissible = (filter === undefined || filter(this.nodes[nb]!.id)) && !this.nodes[nb]!.deleted;
-        if (admissible && (best.size < ef || d < best.peek()!.d)) {
-          frontier.push({ h: nb, d });
-          best.push({ h: nb, d });
+        if (admissible && (best.size < ef || d < best.peekDist())) {
+          frontier.push(nb, d);
+          best.push(nb, d);
           if (best.size > ef) best.pop();
         } else if (!admissible) {
-          frontier.push({ h: nb, d });
+          frontier.push(nb, d);
         }
       }
     }
-    const cands: Cand[] = [];
-    while (best.size > 0) cands.push(best.pop()!);
-    cands.sort((a, b) => a.d - b.d);
-    return { cands, visited: visited.size };
+    const cands = best.drain();
+    return { cands, visited: visitedCount };
   }
 
   /**

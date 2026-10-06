@@ -185,20 +185,20 @@ Deterministic, seeded, reproducible (`npm run bench`):
 
 | mode | efSearch | recall@10 | QPS | avg nodes visited |
 |:-----|---------:|----------:|----:|------------------:|
-| f32 | 16 | 0.9650 | 11,270 | 288.9 |
-| f32 | 64 | 1.0000 | 4,344 | 501.9 |
-| f32 | 128 | 1.0000 | 3,141 | 571.1 |
-| sq8 (ADC) | 16 | 0.9400 | 11,715 | 288.1 |
-| sq8 (ADC) | 64 | 0.9720 | 5,069 | 502.1 |
-| sq8 (ADC) | 128 | 0.9720 | 3,185 | 570.9 |
-| sq4 (ADC) | 16 | 0.5990 | 8,277 | 296.5 |
-| sq4 (ADC) | 64 | 0.5890 | 3,112 | 504.6 |
-| sq4 (ADC) | 128 | 0.5880 | 2,163 | 574.0 |
-| brute force | — | 1.0000 | 312 | 10,000 |
+| f32 | 16 | 0.9650 | 18,681 | 288.9 |
+| f32 | 64 | 1.0000 | 6,861 | 501.9 |
+| f32 | 128 | 1.0000 | 4,861 | 571.1 |
+| sq8 (ADC) | 16 | 0.9400 | 15,437 | 288.1 |
+| sq8 (ADC) | 64 | 0.9720 | 9,387 | 502.1 |
+| sq8 (ADC) | 128 | 0.9720 | 5,409 | 570.9 |
+| sq4 (ADC) | 16 | 0.5990 | 12,853 | 296.5 |
+| sq4 (ADC) | 64 | 0.5890 | 6,754 | 504.6 |
+| sq4 (ADC) | 128 | 0.5880 | 4,535 | 574.0 |
+| brute force | — | 1.0000 | 405 | 10,000 |
 
-build: f32 3.42s · sq8 3.40s · sq4 4.51s · vector storage: 256 → 64 → **32 B/vec** (4× / 8×).
+build: f32 2.05s · sq8 1.87s · sq4 2.06s · vector storage: 256 → 64 → **32 B/vec** (4× / 8×).
 
-Reading the table honestly: at ef=64 the f32 index is **~14× brute force at identical recall** (36× at ef=16).
+Reading the table honestly: at ef=64 the f32 index is **~17× brute force at identical recall** (46× at ef=16).
 Queries are in-distribution (data point + N(0, 0.3) noise) — deliberately off-manifold queries are the known weak
 spot of greedy graph search, in this implementation and every other.
 
@@ -220,7 +220,7 @@ should not include 200 transitive packages, and the algorithm is the product.
 
 ## Acceptance criteria (enforced by CI)
 
-- 48 tests green on Node 22 & 24 — including recall floors for f32/sq8/sq4, degree-cap invariants, filtered-search
+- 51 tests green on Node 22 & 24 — including recall floors for f32/sq8/sq4, degree-cap invariants, filtered-search
   semantics, WAL torn-write recovery, snapshot+WAL round-trips, compaction, a full HTTP restart cycle, and a
   2,500-op seeded fuzz run where a brute-force mirror model must agree with the store at every step;
 - typecheck strict, `verbatimModuleSyntax`, no `any` in the engine;

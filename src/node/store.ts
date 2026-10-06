@@ -22,6 +22,12 @@ export interface StoreOptions {
   quantization?: 'sq8' | 'sq4';
   /** auto-checkpoint after this many WAL ops; 0 disables (default 4096) */
   checkpointEvery?: number;
+  /**
+   * fsync the WAL after every append and the snapshot after every checkpoint
+   * (default false). Real crash durability at a throughput cost; without it a
+   * power loss may lose recent ops even though process death does not.
+   */
+  fsync?: boolean;
 }
 
 export interface StoreInfo extends IndexStats {
@@ -56,12 +62,16 @@ export class VectorStore {
   private walSeq: number;
   private opsSinceCheckpoint = 0;
   private readonly checkpointEvery: number;
+  private readonly fsync: boolean;
   private readonly walPath: string;
   private readonly snapshotPath: string;
+  private readonly lockPath: string;
 
   private constructor(opts: StoreOptions, meta: Meta) {
     this.dataDir = opts.dataDir;
     this.checkpointEvery = opts.checkpointEvery ?? 4096;
+    this.fsync = opts.fsync ?? false;
+    this.lockPath = path.join(opts.dataDir, 'lock');
     this.index = new HnswIndex({
       dim: meta.dim,
       metric: meta.metric,
@@ -98,6 +108,40 @@ export class VectorStore {
       console.warn(`[skipverse] WAL had a torn tail; recovered up to byte boundary`);
     }
     this.walFd = fs.openSync(this.walPath, 'a');
+    this.acquireLock();
+  }
+
+  /** Advisory single-writer lock. A lock from a dead process is auto-cleared. */
+  private acquireLock(): void {
+    if (fs.existsSync(this.lockPath)) {
+      let holder: { pid?: number } = {};
+      try {
+        holder = JSON.parse(fs.readFileSync(this.lockPath, 'utf8'));
+      } catch {
+        // unreadable lock — treat as stale
+      }
+      const pid = holder.pid ?? -1;
+      let alive = false;
+      try {
+        process.kill(pid, 0);
+        alive = true;
+      } catch {
+        alive = pid === process.pid; // EPERM means "exists"; ESRCH means "gone"
+      }
+      if (alive && pid !== process.pid) {
+        throw new Error(`store is locked by another process (pid ${pid}); if this is wrong, delete ${this.lockPath}`);
+      }
+      console.warn(`[skipverse] clearing stale lock from pid ${pid}`);
+    }
+    fs.writeFileSync(this.lockPath, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  }
+
+  private releaseLock(): void {
+    try {
+      fs.unlinkSync(this.lockPath);
+    } catch {
+      // already gone
+    }
   }
 
   /** Open (or create) a store. `dim` must match any existing meta.json. */
@@ -152,6 +196,11 @@ export class VectorStore {
     return ok;
   }
 
+  /** The stored (post-calibration: dequantized) vector for an id, or null. */
+  get(id: string): Float32Array | null {
+    return this.index.vector(id);
+  }
+
   search(query: ArrayLike<number>, k = 10, options: SearchOptions = {}): SearchResult[] {
     return this.index.search(query, k, options);
   }
@@ -183,6 +232,11 @@ export class VectorStore {
     out.set(body, SNAPSHOT_HEADER);
     const tmp = path.join(this.dataDir, SNAPSHOT_TMP);
     fs.writeFileSync(tmp, out);
+    if (this.fsync) {
+      const fd = fs.openSync(tmp, 'r+'); // FlushFileBuffers needs a write handle on Windows
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, this.snapshotPath);
     fs.truncateSync(this.walPath, 0);
     this.opsSinceCheckpoint = 0;
@@ -204,10 +258,12 @@ export class VectorStore {
     if (this.walFd === -1) return;
     fs.closeSync(this.walFd);
     this.walFd = -1;
+    this.releaseLock();
   }
 
   private appendOp(op: Parameters<typeof appendWal>[1]): void {
     appendWal(this.walFd, op, this.index.dim);
+    if (this.fsync) fs.fsyncSync(this.walFd);
     this.opsSinceCheckpoint++;
     if (this.checkpointEvery > 0 && this.opsSinceCheckpoint >= this.checkpointEvery) {
       this.checkpoint();

@@ -1,6 +1,6 @@
 {
   "name": "skipverse",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A from-scratch vector database: HNSW approximate nearest neighbor index, zero runtime dependencies, crash-safe WAL, deterministic replay, and a living search visualization.",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,7 @@
     "test": "tsx --test \"test/*.test.ts\"",
     "demo:build": "node demo/build.mjs",
     "serve": "tsx src/node/cli.ts serve",
+    "example": "tsx examples/quickstart.ts",
     "bench": "tsx bench/bench.ts",
     "bench:ci": "tsx bench/bench.ts --small --assert",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"

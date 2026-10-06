@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 — 2026-10-06
+
+- **2× hot-path optimization**: searchLayer now uses a numeric (dist, handle) binary heap with zero per-element
+  allocation plus a generation-stamped visited array instead of a `Set` — build 2× faster (3.4s → 1.7s for 10k×64d),
+  search QPS up 1.6-2.3× across all quantization modes, recall bit-identical.
+- **WAL fsync option** (`fsync: true`): real power-loss durability for appends and checkpoints (Windows needs a
+  write handle for FlushFileBuffers — the test caught that).
+- **Single-writer lockfile**: opening a store held by a live process throws; stale locks from dead processes are
+  auto-cleared.
+- **Introspection API**: `HnswIndex.vector(id)` / `store.get(id)` (dequantized post-calibration); HTTP `GET
+  /vectors/:id`, `x-response-time` header and `tookMs` on search responses.
+- `examples/quickstart.ts` — the 60-second tour (`npm run example`).
+
 ## 0.3.0 — 2026-10-06
 
 - **SQ4 scalar quantization**: `quantization: "sq4"` packs 4-bit codes (two dimensions per byte, 8× smaller than

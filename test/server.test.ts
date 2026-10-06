@@ -40,8 +40,10 @@ describe('HTTP server', () => {
       method: 'POST',
       body: JSON.stringify({ vec: Array.from(ds.queries[0]!), k: 5, ef: 64 }),
     });
-    const body = (await r.json()) as { results: { id: string; dist: number }[] };
+    const body = (await r.json()) as { results: { id: string; dist: number }[]; tookMs: number };
     assert.equal(body.results.length, 5);
+    assert.ok(typeof body.tookMs === 'number' && body.tookMs >= 0);
+    assert.ok(r.headers.get('x-response-time') !== null, 'x-response-time header present');
     const expected = bruteForceTop1();
     assert.equal(body.results[0]!.id, expected);
 
@@ -71,6 +73,13 @@ describe('HTTP server', () => {
   }
 
   it('deletes, checkpoints, reports stats, and rejects bad input', async () => {
+    const g = await fetch(`${base}/vectors/1`);
+    const gb = (await g.json()) as { id: string; vec: number[] };
+    assert.equal(gb.id, '1');
+    assert.equal(gb.vec.length, 8);
+    const missing = await fetch(`${base}/vectors/nope`);
+    assert.equal(missing.status, 404);
+
     const d = await fetch(`${base}/vectors/0`, { method: 'DELETE' });
     assert.deepEqual(await d.json(), { removed: true });
     const d2 = await fetch(`${base}/vectors/0`, { method: 'DELETE' });

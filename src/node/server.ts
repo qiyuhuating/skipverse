@@ -20,7 +20,10 @@ const MIME: Record<string, string> = {
 };
 
 function send(res: http.ServerResponse, code: number, body: string | Uint8Array, type = 'application/json; charset=utf-8'): void {
-  res.writeHead(code, { 'content-type': type, 'content-length': body.length });
+  const start = (res as http.ServerResponse & { start?: number }).start;
+  const headers: Record<string, string | number> = { 'content-type': type, 'content-length': body.length };
+  if (start !== undefined) headers['x-response-time'] = `${(performance.now() - start).toFixed(2)}ms`;
+  res.writeHead(code, headers);
   res.end(body);
 }
 
@@ -52,12 +55,20 @@ export function createServer(opts: ServerOptions): http.Server {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const route = `${req.method} ${url.pathname}`;
+    const started = performance.now();
+    (res as http.ServerResponse & { start?: number }).start = started;
     try {
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return json(res, 200, { ok: true, count: store.index.size });
       }
       if (req.method === 'GET' && url.pathname === '/stats') {
         return json(res, 200, store.info());
+      }
+      if (req.method === 'GET' && url.pathname.startsWith('/vectors/')) {
+        const id = decodeURIComponent(url.pathname.slice('/vectors/'.length));
+        const vec = store.get(id);
+        if (vec === null) return json(res, 404, { error: 'no such vector' });
+        return json(res, 200, { id, vec: Array.from(vec) });
       }
       if (req.method === 'POST' && url.pathname === '/vectors') {
         const body = JSON.parse(await readBody(req)) as { vectors?: { id: string; vec: number[] }[] };
@@ -76,9 +87,9 @@ export function createServer(opts: ServerOptions): http.Server {
         const k = Math.min(Math.max(body.k ?? 10, 1), 1000);
         if (body.trace) {
           const { results, trace } = store.searchWithTrace(body.vec, k, { ef: body.ef });
-          return json(res, 200, { results, trace });
+          return json(res, 200, { results, trace, tookMs: +(performance.now() - started).toFixed(3) });
         }
-        return json(res, 200, { results: store.search(body.vec, k, { ef: body.ef }) });
+        return json(res, 200, { results: store.search(body.vec, k, { ef: body.ef }), tookMs: +(performance.now() - started).toFixed(3) });
       }
       if (req.method === 'DELETE' && url.pathname.startsWith('/vectors/')) {
         const id = decodeURIComponent(url.pathname.slice('/vectors/'.length));
