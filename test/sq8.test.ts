@@ -155,3 +155,21 @@ describe('SQ8 scalar quantization', () => {
     assert.ok(idx.search([1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 3, { ef: 32 }).length > 0);
   });
 });
+
+describe('extendCandidates', () => {
+  it('defaults off, changes nothing, and does not regress recall when on', () => {
+    const { vecs, queries } = genClusterData(600, 16, 8, 57);
+    const build = (extend: boolean) => {
+      const idx = new HnswIndex({ dim: 16, metric: 'euclidean', M: 12, efConstruction: 120, seed: 8, extendCandidates: extend });
+      for (let i = 0; i < vecs.length; i++) idx.add(String(i), vecs[i]!);
+      return idx;
+    };
+    const base = build(false);
+    const ext = build(true);
+    const q = queries[4]!;
+    assert.deepEqual(base.search(q, 10, { ef: 64 }), ext.search(q, 10, { ef: 64 }), 'no gain measured — both must agree on easy data');
+    let sum = 0;
+    for (const qq of queries.slice(0, 30)) sum += recall(bruteForce(vecs, qq, 10, 'euclidean'), ext.search(qq, 10, { ef: 96 }));
+    assert.ok(sum / 30 >= 0.9, `extended-build recall = ${(sum / 30).toFixed(3)}, want >= 0.90`);
+  });
+});

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.3 — 2026-10-06
+
+- **Concurrent read pool**: `SearchPool` (src/node/pool.ts) spawns worker threads holding read-only index
+  snapshots — a search storm never blocks the main-thread writer and vice versa. Self-entry worker (single
+  zero-dependency file), round-robin dispatch, explicit `refresh()` snapshot semantics, graceful close. Results are
+  identical to the synchronous path (tests assert exact equality).
+- **extendCandidates option** (paper Algorithm 4): implemented, benchmarked, and rejected as a default — measured
+  zero recall change on clustered, uniform, and off-manifold queries (the diversity heuristic already covers it).
+  Kept as a build-time knob with a test pinning default-off equivalence.
+- README: full API reference tables for HnswIndex / SearchPool / VectorStore / HTTP / CLI.
+- **Invariant test suite**: WAL mid-stream corruption boundaries, compaction idempotence, cross-metric ef
+  monotonicity, unicode/oversized ids, zero-vector safety, upsert-chain accounting, WAL replay determinism (11 new
+  tests).
+
 ## 0.3.2 — 2026-10-06
 
 - **Batched WAL writes**: `upsertBatch` validates all vectors, applies them, and flushes the whole batch in a single

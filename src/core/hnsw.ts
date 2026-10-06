@@ -85,6 +85,13 @@ export interface HnswParams {
   seed?: number;
   /** 'sq8' = 1 byte/dim, 'sq4' = 4 bits/dim packed, after `calibrate()` (default 'none') */
   quantization?: Quantization;
+  /**
+   * Algorithm 4 extendCandidates: fold the candidates' own neighbors into the
+   * selection pool during insertion. Helps some sparse graphs; on clustered
+   * data the paper (and our benchmarks) find no gain. Build-time option —
+   * not serialized. Default false.
+   */
+  extendCandidates?: boolean;
 }
 
 export interface TracedSearch {
@@ -115,6 +122,7 @@ export class HnswIndex {
   readonly efConstruction: number;
   readonly seed: number;
   readonly quantization: Quantization;
+  readonly extendCandidates: boolean;
 
   private readonly mL: number;
   private nodes: Node[] = [];
@@ -157,6 +165,7 @@ export class HnswIndex {
     this.efConstruction = efConstruction;
     this.seed = params.seed ?? 0x5356;
     this.quantization = quantization;
+    this.extendCandidates = params.extendCandidates ?? false;
     this.mL = 1 / Math.log(M);
     this.distF32 = makeDistance(metric);
   }

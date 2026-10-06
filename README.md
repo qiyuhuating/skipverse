@@ -212,6 +212,74 @@ lossy, and this clustered geometry is full of near-tie distances that 4-bit code
 distributions lose far less). Treat it as a coarse-filter stage or a memory-last resort; rescoring with original
 vectors is the natural next layer and lives on the roadmap.
 
+## API reference
+
+### HnswIndex (embeddable, isomorphic)
+
+| signature | what it does | notes |
+|:--|:--|:--|
+| `new HnswIndex({ dim, metric?, M?, efConstruction?, seed?, quantization? })` | create an index | `metric`: cosine (default) / euclidean / dot · `M` 16 · `efConstruction` 200 · `seed` pins layer assignment |
+| `add(id, vec)` | insert or replace | replace soft-deletes the old vector · vec: `number[]` / `Float32Array` |
+| `remove(id)` | soft delete | stays as traversal anchor, filtered from results · returns `false` if absent |
+| `search(q, k?, { ef?, filter? })` | k nearest | `ef` defaults to `max(k, 16)` · `filter(id)`: excluded nodes are traversed, never returned |
+| `searchWithTrace(q, k?, opts?)` | search + traversal | returns `{ results, trace }` — the demo animates `trace.layers` |
+| `vector(id)` | stored vector | dequantized after calibration · null when absent/deleted |
+| `adjacency(id)` | per-level neighbor ids | for visualization / introspection |
+| `compacted()` | rebuild without tombstones | deterministic · calibration carries over |
+| `calibrate()` | freeze ranges, rewrite codes | one-shot, requires `quantization: "sq4" | "sq8"` |
+| `serialize()` / `HnswIndex.deserialize(data)` | binary round-trip | format v2 · v1 indexes still load |
+| `stats()` | counts, per-level degree stats | |
+| `size` · `deletedCount` · `isCalibrated` · `bytesPerVector` | live metrics | |
+
+### SearchPool (concurrent reads, Node)
+
+| signature | what it does | notes |
+|:--|:--|:--|
+| `new SearchPool({ store, workers? })` | N workers hold read-only snapshots | default: `cpus−1` capped at 4 |
+| `searchAsync(vec, k?, ef?)` | search off the main thread | promise per request, round-robin dispatch |
+| `refresh()` | broadcast a fresh snapshot | required after writes — snapshots are explicit |
+| `close()` | drain and exit all workers | in-flight searches settle first |
+
+Single file, worker re-enters the module itself, zero dependencies. Results are identical to the synchronous path.
+
+### VectorStore (durable, Node)
+
+| signature | what it does | notes |
+|:--|:--|:--|
+| `VectorStore.open({ dataDir, dim, metric?, M?, efConstruction?, seed?, quantization?, fsync?, checkpointEvery? })` | open or create | validates meta.json on reopen · `fsync: true` = real power-loss durability |
+| `upsert(id, vec)` / `upsertBatch(entries)` | writes | batch = one WAL syscall (one fsync per batch) |
+| `remove(id)` · `get(id)` | tombstone / read back | `get` is dequantized post-calibration |
+| `search(q, k?, opts?)` / `searchWithTrace(...)` | queries | delegates to the index |
+| `calibrate()` | calibrate + rotate snapshot | |
+| `compact()` | rebuild + snapshot rotation | returns `{ before, after }` |
+| `checkpoint()` | snapshot + WAL truncate | automatic every `checkpointEvery` ops (default 4096) |
+| `close(checkpoint?)` | release lock + fd | |
+| `info()` | stats + WAL bytes | |
+
+Single-writer: a store held by a live process refuses a second `open`; stale locks from dead processes are cleared automatically.
+
+### HTTP API
+
+| route | body | response |
+|:--|:--|:--|
+| `POST /vectors` | `{ vectors: [{id, vec}] }` | `{ upserted, count }` |
+| `GET /vectors/:id` | — | `{ id, vec }` · 404 if absent |
+| `DELETE /vectors/:id` | — | `{ removed }` |
+| `POST /search` | `{ vec, k?, ef?, trace? }` | `{ results, tookMs }` · + `trace` when asked |
+| `GET /stats` | — | index + WAL stats |
+| `POST /checkpoint` | — | `{ ok }` |
+| `GET /healthz` | — | `{ ok, count }` |
+
+Every response carries an `x-response-time` header.
+
+### CLI
+
+| command | flags | purpose |
+|:--|:--|:--|
+| `skipverse serve` | `--port --data --dim --metric --M --ef-construction --quantization` | HTTP + demo |
+| `skipverse import` | `--file vectors.jsonl` + store flags | bulk load (500/batch) |
+| `skipverse calibrate` | store flags | freeze ranges + rewrite codes |
+
 ## Zero dependencies
 
 `package.json` lists four **dev**Dependencies (typescript, tsx, esbuild, @types/node) and nothing else. The engine
@@ -230,7 +298,7 @@ should not include 200 transitive packages, and the algorithm is the product.
 
 - [ ] PQ / residual codes on top of SQ4 (two-stage rerank to recover low-bit recall)
 - [ ] online recalibration when the data distribution drifts
-- [ ] concurrent readers (copy-on-write snapshot reads)
+- [x] concurrent readers (worker-thread snapshot pool) — v0.3.3
 - [ ] memory-mapped snapshot loader (zero-copy warm start)
 - [ ] WASM build of the core for CDN-drop usage
 
