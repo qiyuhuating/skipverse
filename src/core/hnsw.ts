@@ -287,7 +287,9 @@ export class HnswIndex {
       eps = [this.greedy(q, eps[0]!, l)];
     }
     for (let l = Math.min(level, this.maxLevel); l >= 0; l--) {
-      const { cands } = this.searchLayer(q, eps, this.efConstruction, l);
+      let { cands } = this.searchLayer(q, eps, this.efConstruction, l);
+      if (cands.length === 0) cands = this.anchorFallback(q, h, l);
+      if (this.extendCandidates) cands = this.extendCandidateSet(q, cands, l, this.efConstruction * 2);
       const maxM = l === 0 ? this.M0 : this.M;
       const selected = this.selectNeighbors(cands, this.M);
       this.nodes[h]!.links[l] = selected;
@@ -633,6 +635,41 @@ export class HnswIndex {
    * scan candidates near→far, keep one only if it is closer to the base point
    * than to every already-kept neighbor. Prevents mutual-cluster hubs.
    */
+  /**
+   * Degenerate-graph fallback: when the beam comes back empty every existing
+   * node is a deleted anchor (e.g. a single-id upsert chain). Link the new
+   * node to the nearest existing nodes regardless of deletion — connectivity
+   * beats tombstone purity, and compaction reclaims the links later.
+   */
+  private anchorFallback(q: QVec, self: number, level: number): Cand[] {
+    const cands: Cand[] = [];
+    for (let x = this.nodes.length - 1; x >= 0 && cands.length < this.M; x--) {
+      if (x === self || level > this.nodes[x]!.level) continue;
+      cands.push({ h: x, d: this.dist(x, q) });
+    }
+    cands.sort((a, b) => a.d - b.d);
+    return cands;
+  }
+
+  /**
+   * Algorithm 4 extendCandidates: one non-recursive pass folding each
+   * candidate's layer neighbors into the pool, capped at `cap` entries.
+   */
+  private extendCandidateSet(q: QVec, cands: Cand[], level: number, cap: number): Cand[] {
+    const seen = new Set<number>(cands.map((c) => c.h));
+    const out = cands.slice();
+    const base = cands.slice();
+    for (const c of base) {
+      for (const nb of this.nodes[c.h]!.links[level] ?? []) {
+        if (seen.has(nb)) continue;
+        seen.add(nb);
+        out.push({ h: nb, d: this.dist(nb, q) });
+        if (out.length >= cap) return out;
+      }
+    }
+    return out;
+  }
+
   private selectNeighbors(cands: Cand[], M: number): number[] {
     const sorted = cands.slice().sort((a, b) => a.d - b.d);
     const kept: Cand[] = [];

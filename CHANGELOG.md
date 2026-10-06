@@ -6,9 +6,9 @@
   snapshots — a search storm never blocks the main-thread writer and vice versa. Self-entry worker (single
   zero-dependency file), round-robin dispatch, explicit `refresh()` snapshot semantics, graceful close. Results are
   identical to the synchronous path (tests assert exact equality).
-- **extendCandidates option** (paper Algorithm 4): implemented, benchmarked, and rejected as a default — measured
-  zero recall change on clustered, uniform, and off-manifold queries (the diversity heuristic already covers it).
-  Kept as a build-time knob with a test pinning default-off equivalence.
+- **extendCandidates option** (paper Algorithm 4): implemented and benchmarked honestly — +0.006 recall on
+  off-manifold queries for ~2× build cost, zero gain in-distribution. Rejected as a default (the diversity
+  heuristic already covers it); kept as a build-time knob with a default-off equivalence test.
 - README: full API reference tables for HnswIndex / SearchPool / VectorStore / HTTP / CLI.
 - **Invariant test suite**: WAL mid-stream corruption boundaries, compaction idempotence, cross-metric ef
   monotonicity, unicode/oversized ids, zero-vector safety, upsert-chain accounting, WAL replay determinism (11 new

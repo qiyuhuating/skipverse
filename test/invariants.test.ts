@@ -268,12 +268,13 @@ describe('upsert chains', () => {
     }
     assert.equal(idx.deletedCount, 9, '10 adds → exactly 9 tombstones, never more');
 
-    // KNOWN CORE BUG (reported, not fixed here): overwriting the only id of an
-    // index soft-deletes the old node before the new node links, so the fresh
-    // node finds no alive candidates and becomes an island; once the (linkless)
-    // entry point is deleted, search() returns [] on a non-empty index.
-    // Pinned current behavior — flipping this assertion is the fix signal:
-    assert.equal(idx.search(dirs[9]!, 3).length, 0, 'pinned bug: single-id upsert chain disconnects the graph');
+    // fixed via anchorFallback: a beam that comes back empty (everything is a
+    // tombstone) falls back to linking against the nearest existing anchors,
+    // so even a single-id upsert chain stays searchable
+    const top = idx.search(dirs[9]!, 3);
+    assert.ok(top.length >= 1, 'single-id upsert chain must remain searchable');
+    assert.equal(top[0]!.id, 'rover');
+    assert.ok(top[0]!.dist < 1e-5, 'the newest vector must be found exactly');
 
     // the data itself is intact: compaction rebuilds a searchable graph
     const fresh = idx.compacted();
