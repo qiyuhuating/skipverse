@@ -16,7 +16,7 @@ interface BenchConfig {
   seed: number;
 }
 
-type Mode = 'f32' | 'sq8' | 'sq4';
+type Mode = 'f32' | 'sq8' | 'sq4' | 'pq';
 
 interface ModeResult {
   mode: Mode;
@@ -27,7 +27,7 @@ interface ModeResult {
 
 const DEFAULTS: BenchConfig = { n: 10_000, dim: 64, clusters: 20, numQueries: 100, k: 10, rounds: 5, seed: 1234 };
 const SMALL: BenchConfig = { n: 4_000, dim: 32, clusters: 25, numQueries: 50, k: 10, rounds: 3, seed: 1234 };
-const MODES: Mode[] = ['f32', 'sq8', 'sq4'];
+const MODES: Mode[] = ['f32', 'sq8', 'sq4', 'pq'];
 const quantizationOf = (m: Mode): Quantization | undefined => (m === 'f32' ? undefined : m);
 
 function buildIndex(cfg: BenchConfig, mode: Mode): Index {
@@ -39,6 +39,7 @@ function buildIndex(cfg: BenchConfig, mode: Mode): Index {
     efConstruction: 200,
     seed: 42,
     quantization: quantizationOf(mode),
+    pqSubspaces: mode === 'pq' ? Math.ceil(cfg.dim / 2) : undefined,
   });
   for (let i = 0; i < vecs.length; i++) idx.add(String(i), vecs[i]!);
   if (mode !== 'f32') idx.calibrate();
@@ -97,7 +98,7 @@ function main(): void {
     `| brute force | — | 1.0000 | ${Math.round(bruteQps).toLocaleString()} | ${cfg.n.toLocaleString()} |`,
     '',
     `build: ${runs.map((r) => `${r.mode} ${(r.buildMs / 1000).toFixed(2)}s`).join(' · ')}`,
-    `vector storage: ${runs.map((r) => `${r.mode} ${r.bytesPerVector} B/vec`).join(' · ')} · f32/sq8 = ${(runs[0]!.bytesPerVector / runs[1]!.bytesPerVector).toFixed(1)}× · f32/sq4 = ${(runs[0]!.bytesPerVector / runs[2]!.bytesPerVector).toFixed(1)}×`,
+    `vector storage: ${runs.map((r) => `${r.mode} ${r.bytesPerVector} B/vec`).join(' · ')} · f32/sq8 = ${(runs[0]!.bytesPerVector / runs[1]!.bytesPerVector).toFixed(1)}× · f32/sq4 = ${(runs[0]!.bytesPerVector / runs[2]!.bytesPerVector).toFixed(1)}× · f32/pq = ${(runs[0]!.bytesPerVector / runs[3]!.bytesPerVector).toFixed(1)}×`,
   ];
   console.log(lines.join('\n'));
 
@@ -107,6 +108,7 @@ function main(): void {
       ['f32', 0.95, 64],
       ['sq8', 0.9, 64],
       ['sq4', 0.5, 64],
+      ['pq', 0.75, 64],
     ];
     for (const [mode, floor, ef] of gates) {
       const run = runs.find((r) => r.mode === mode)!;

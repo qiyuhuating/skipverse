@@ -1,6 +1,6 @@
 {
   "name": "skipverse",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "A from-scratch vector database: HNSW approximate nearest neighbor index, zero runtime dependencies, crash-safe WAL, deterministic replay, and a living search visualization.",
   "type": "module",
   "license": "MIT",

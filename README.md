@@ -113,6 +113,12 @@ idx.add("new-doc", vec);   // later inserts are quantized through the frozen ran
 `quantization: "sq4"` packs the same affine map into 4-bit nibbles (8× smaller, noticeably lossy — see the honest
 benchmark below).
 
+`quantization: "pq"` (product quantization) goes further: 32 subspaces each get their own deterministic k-means
+codebook (256 centroids), a vector becomes one codebook index per subspace — 8 B/vec for 64d, **32× smaller**. At
+equal 8× compression PQ scores **0.742 recall@10 where SQ4 scores 0.589** on the benchmark below; the price is
+k-means training time during `calibrate()` (~3× the SQ build). Distances run through a per-query m×256 asymmetric
+distance-computation table — one table build per query, then one lookup per subspace per candidate.
+
 Under the hood the quantized kernels do real math, not byte-tricks. For **euclidean**, search uses *asymmetric
 distance computation*: the query stays exact f32 (reduced to `v⊙step`, `v·min`, `‖v‖²`) and each pair costs one
 dim-loop plus three scalars against the dequantized code. For **cosine/dot**, both sides are u8 codes evaluated via
@@ -185,18 +191,21 @@ Deterministic, seeded, reproducible (`npm run bench`):
 
 | mode | efSearch | recall@10 | QPS | avg nodes visited |
 |:-----|---------:|----------:|----:|------------------:|
-| f32 | 16 | 0.9650 | 18,681 | 288.9 |
-| f32 | 64 | 1.0000 | 6,861 | 501.9 |
-| f32 | 128 | 1.0000 | 4,861 | 571.1 |
-| sq8 (ADC) | 16 | 0.9400 | 15,437 | 288.1 |
-| sq8 (ADC) | 64 | 0.9720 | 9,387 | 502.1 |
-| sq8 (ADC) | 128 | 0.9720 | 5,409 | 570.9 |
-| sq4 (ADC) | 16 | 0.5990 | 12,853 | 296.5 |
-| sq4 (ADC) | 64 | 0.5890 | 6,754 | 504.6 |
-| sq4 (ADC) | 128 | 0.5880 | 4,535 | 574.0 |
-| brute force | — | 1.0000 | 405 | 10,000 |
+| f32 | 16 | 0.9650 | 10,911 | 288.9 |
+| f32 | 64 | 1.0000 | 4,952 | 501.9 |
+| f32 | 128 | 1.0000 | 3,467 | 571.1 |
+| sq8 (ADC) | 16 | 0.9400 | 13,111 | 288.1 |
+| sq8 (ADC) | 64 | 0.9720 | 6,701 | 502.1 |
+| sq8 (ADC) | 128 | 0.9720 | 4,169 | 570.9 |
+| sq4 (ADC) | 16 | 0.5990 | 6,921 | 296.5 |
+| sq4 (ADC) | 64 | 0.5890 | 3,273 | 504.6 |
+| sq4 (ADC) | 128 | 0.5880 | 2,566 | 574.0 |
+| pq (ADC) | 16 | 0.7330 | 4,686 | 289.7 |
+| pq (ADC) | 64 | 0.7420 | 2,893 | 503.7 |
+| pq (ADC) | 128 | 0.7420 | 2,243 | 573.3 |
+| brute force | — | 1.0000 | 197 | 10,000 |
 
-build: f32 2.05s · sq8 1.87s · sq4 2.06s · vector storage: 256 → 64 → **32 B/vec** (4× / 8×).
+build: f32 2.70s · sq8 2.86s · sq4 4.06s · pq 12.16s (k-means training) · vector storage: 256 → 64 → 32 → **8 B/vec** (4× / 8× / 32×).
 
 Reading the table honestly: at ef=64 the f32 index is **~17× brute force at identical recall** (46× at ef=16).
 Queries are in-distribution (data point + N(0, 0.3) noise) — deliberately off-manifold queries are the known weak
@@ -218,7 +227,7 @@ vectors is the natural next layer and lives on the roadmap.
 
 | signature | what it does | notes |
 |:--|:--|:--|
-| `new HnswIndex({ dim, metric?, M?, efConstruction?, seed?, quantization? })` | create an index | `metric`: cosine (default) / euclidean / dot · `M` 16 · `efConstruction` 200 · `seed` pins layer assignment |
+| `new HnswIndex({ dim, metric?, M?, efConstruction?, seed?, quantization?, pqSubspaces?, extendCandidates? })` | create an index | `metric`: cosine (default) / euclidean / dot · `M` 16 · `efConstruction` 200 · `seed` pins layer assignment · `quantization`: none / sq8 / sq4 / pq |
 | `add(id, vec)` | insert or replace | replace soft-deletes the old vector · vec: `number[]` / `Float32Array` |
 | `remove(id)` | soft delete | stays as traversal anchor, filtered from results · returns `false` if absent |
 | `search(q, k?, { ef?, filter? })` | k nearest | `ef` defaults to `max(k, 16)` · `filter(id)`: excluded nodes are traversed, never returned |
@@ -288,17 +297,18 @@ should not include 200 transitive packages, and the algorithm is the product.
 
 ## Acceptance criteria (enforced by CI)
 
-- 51 tests green on Node 22 & 24 — including recall floors for f32/sq8/sq4, degree-cap invariants, filtered-search
+- 77 tests green on Node 22 & 24 — including recall floors for f32/sq8/sq4, degree-cap invariants, filtered-search
   semantics, WAL torn-write recovery, snapshot+WAL round-trips, compaction, a full HTTP restart cycle, and a
   2,500-op seeded fuzz run where a brute-force mirror model must agree with the store at every step;
 - typecheck strict, `verbatimModuleSyntax`, no `any` in the engine;
-- the CI benchmark run must hold **f32 ≥ 0.95, sq8 ≥ 0.90, sq4 ≥ 0.50 recall@10 at ef=64** or the build fails.
+- the CI benchmark run must hold **f32 ≥ 0.95, sq8 ≥ 0.90, sq4 ≥ 0.50, pq ≥ 0.80 recall@10 at ef=64** or the build fails.
 
 ## Roadmap
 
-- [ ] PQ / residual codes on top of SQ4 (two-stage rerank to recover low-bit recall)
+- [ ] SQ4/PQ residual rescoring stage (recover low-bit recall with a second pass)
 - [ ] online recalibration when the data distribution drifts
 - [x] concurrent readers (worker-thread snapshot pool) — v0.3.3
+- [x] product quantization with deterministic k-means training — v0.4.0
 - [ ] memory-mapped snapshot loader (zero-copy warm start)
 - [ ] WASM build of the core for CDN-drop usage
 

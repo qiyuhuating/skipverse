@@ -1,4 +1,5 @@
 import { BufReader, BufWriter } from './binary.js';
+import { distPqSym, encodePq, reconstructPq, trainPq, type PqModel } from './pq.js';
 import { makeDistance, prepareVector, type DistanceFn } from './distance.js';
 import { CandHeap } from './cand-heap.js';
 import { hashSeed, mulberry32 } from './rng.js';
@@ -12,13 +13,13 @@ import type {
 } from './types.js';
 
 const MAGIC = new Uint8Array([0x53, 0x4b, 0x56, 0x31]); // "SKV1"
-const FORMAT_VERSION = 2;
+const FORMAT_VERSION = 3;
 const MAX_LEVEL = 32;
 
 const METRIC_CODE: Record<Metric, number> = { euclidean: 0, cosine: 1, dot: 2 };
 const METRIC_BY_CODE: Metric[] = ['euclidean', 'cosine', 'dot'];
 
-export type Quantization = 'none' | 'sq4' | 'sq8';
+export type Quantization = 'none' | 'pq' | 'sq4' | 'sq8';
 /**
  * per-node scalars derived from the u8 codes + calibration (never serialized —
  * recomputed on load): cosine/dot need `dotC`/`norm` for the symmetric
@@ -73,6 +74,8 @@ interface QVec {
   qs?: Float32Array;
   qm?: number;
   q2?: number;
+  /** pq: per-subspace distance/dot table (m × 256), built once per query */
+  table?: Float32Array;
 }
 
 export interface HnswParams {
@@ -92,6 +95,8 @@ export interface HnswParams {
    * not serialized. Default false.
    */
   extendCandidates?: boolean;
+  /** subspaces for quantization: 'pq' (default 8; each holds its own 256-centroid codebook) */
+  pqSubspaces?: number;
 }
 
 export interface TracedSearch {
@@ -123,6 +128,7 @@ export class HnswIndex {
   readonly seed: number;
   readonly quantization: Quantization;
   readonly extendCandidates: boolean;
+  readonly pqSubspaces: number;
 
   private readonly mL: number;
   private nodes: Node[] = [];
@@ -133,6 +139,8 @@ export class HnswIndex {
   private alive = 0;
   private deleted = 0;
   private calibration: Calibration | null = null;
+  /** product-quantization codebooks; non-null iff quantization === 'pq' && calibrated */
+  private pq: PqModel | null = null;
   /** generation-stamped visited marks for searchLayer — no Set allocations on the hot path */
   private visitStamp: Uint32Array = new Uint32Array(1024);
   private visitGen = 0;
@@ -151,12 +159,18 @@ export class HnswIndex {
     const M = params.M ?? 16;
     const efConstruction = params.efConstruction ?? 200;
     const quantization = params.quantization ?? 'none';
-    if (!Number.isInteger(M) || M < 2) throw new Error(`M must be an integer ≥ 2, got ${M}`);
+    if (!Number.isInteger(M) || M < 2 || M > 32767) {
+      throw new Error(`M must be an integer in [2, 32767], got ${M}`);
+    }
     if (!Number.isInteger(efConstruction) || efConstruction < 1) {
       throw new Error(`efConstruction must be an integer ≥ 1, got ${efConstruction}`);
     }
-    if (quantization !== 'none' && quantization !== 'sq4' && quantization !== 'sq8') {
-      throw new Error(`quantization must be "none", "sq4" or "sq8", got ${quantization}`);
+    if (quantization !== 'none' && quantization !== 'pq' && quantization !== 'sq4' && quantization !== 'sq8') {
+      throw new Error(`quantization must be "none", "pq", "sq4" or "sq8", got ${quantization}`);
+    }
+    const pqSubspaces = params.pqSubspaces ?? 8;
+    if (!Number.isInteger(pqSubspaces) || pqSubspaces < 1) {
+      throw new Error(`pqSubspaces must be an integer ≥ 1, got ${pqSubspaces}`);
     }
     this.dim = dim;
     this.metric = metric;
@@ -166,6 +180,7 @@ export class HnswIndex {
     this.seed = params.seed ?? 0x5356;
     this.quantization = quantization;
     this.extendCandidates = params.extendCandidates ?? false;
+    this.pqSubspaces = pqSubspaces;
     this.mL = 1 / Math.log(M);
     this.distF32 = makeDistance(metric);
   }
@@ -185,7 +200,7 @@ export class HnswIndex {
   /** bytes a stored vector occupies (excluding graph links) — one byte per dimension */
   get bytesPerVector(): number {
     if (this.calibration === null) return this.dim * 4;
-    return this.quantization === 'sq4' ? Math.ceil(this.dim / 2) : this.dim;
+    return this.quantization === 'pq' ? this.pq!.m : this.quantization === 'sq4' ? Math.ceil(this.dim / 2) : this.dim;
   }
 
   /**
@@ -194,9 +209,32 @@ export class HnswIndex {
    * ranges (clamped) — the "train once, serve" model used by faiss/hnswlib.
    */
   calibrate(): void {
-    if (this.quantization === 'none') throw new Error('calibrate() requires quantization: "sq4" or "sq8"');
+    if (this.quantization === 'none') throw new Error('calibrate() requires quantization: "pq", "sq4" or "sq8"');
     if (this.calibration !== null) throw new Error('index is already calibrated');
     if (this.nodes.length === 0) throw new Error('cannot calibrate an empty index');
+
+    if (this.quantization === 'pq') {
+      // product quantization: train codebooks on the stored f32 vectors
+      const vecs = this.nodes.map((n) => n.vec as Float32Array);
+      this.pq = trainPq(vecs, this.dim, this.pqSubspaces, 256, this.seed);
+      // sentinel calibration keeps the "calibrated" flag machinery uniform;
+      // the pq kernels never read min/max/step
+      this.calibration = {
+        min: new Float32Array(this.dim),
+        max: new Float32Array(this.dim).fill(1),
+        step: new Float32Array(this.dim).fill(1 / 255),
+        c: new Float32Array(this.dim),
+        k: 0,
+        levels: 255,
+      };
+      this.distQ = null;
+      this.distAdc = null; // pq distances run through the table branch in dist()
+      for (const node of this.nodes) {
+        node.vec = encodePq(this.pq, node.vec as Float32Array);
+        node.aux = this.auxOf(node.vec as Uint8Array);
+      }
+      return;
+    }
 
     const { dim } = this;
     const levels = this.quantization === 'sq4' ? 15 : 255;
@@ -235,7 +273,9 @@ export class HnswIndex {
   /** Insert or replace. Replacing soft-deletes the previous vector. */
   add(id: string, vec: ArrayLike<number>): void {
     if (this.calibration !== null && vec instanceof Uint8Array) {
-      this.insertPrepared(id, vec, this.auxOf(vec));
+      // calibrated euclidean needs the exact-f32 anchor for ADC: dequantize the codes
+      const exact = this.metric === 'euclidean' ? this.dequantize(vec) : undefined;
+      this.insertPrepared(id, vec, this.auxOf(vec), exact);
       return;
     }
     const f = prepareVector(vec, this.metric, this.dim);
@@ -279,9 +319,11 @@ export class HnswIndex {
     }
 
     const q: QVec =
-      this.calibration !== null && this.metric === 'euclidean' && exact !== undefined
-        ? this.adcQuery(exact)
-        : { vec, aux };
+      this.calibration !== null && this.quantization === 'pq' && exact !== undefined
+        ? this.pqQuery(exact)
+        : this.calibration !== null && this.metric === 'euclidean' && exact !== undefined
+          ? this.adcQuery(exact)
+          : { vec, aux };
     let eps: number[] = [this.entry];
     for (let l = this.maxLevel; l > level; l--) {
       eps = [this.greedy(q, eps[0]!, l)];
@@ -437,12 +479,20 @@ export class HnswIndex {
       efConstruction: this.efConstruction,
       seed: this.seed,
       quantization: this.quantization,
+      extendCandidates: this.extendCandidates,
     });
-    if (this.calibration !== null) fresh.adoptCalibration(this.calibration);
+    if (this.quantization === 'pq' && this.pq !== null) {
+      fresh.pq = this.pq;
+      fresh.calibration = this.calibration; // sentinel; pq kernels never read it
+      fresh.distQ = null;
+      fresh.distAdc = null;
+    } else if (this.calibration !== null) {
+      fresh.adoptCalibration(this.calibration);
+    }
     for (const node of this.nodes) {
       if (!node.deleted) {
-        // calibrated euclidean: re-anchor inserts on the dequantized vector
-        const exact = this.calibration !== null && this.metric === 'euclidean' ? this.dequantize(node.vec as Uint8Array) : undefined;
+        // calibrated: re-anchor inserts on the reconstructed vector
+        const exact = this.calibration !== null ? this.dequantize(node.vec as Uint8Array) : undefined;
         fresh.insertPrepared(node.id, node.vec, node.aux, exact);
       }
     }
@@ -452,6 +502,7 @@ export class HnswIndex {
   // ------------------------------------------------------------------ kernel
 
   private quantizeStored(v: Float32Array): Uint8Array {
+    if (this.quantization === 'pq') return encodePq(this.pq!, v);
     const cal = this.calibration!;
     const packed = this.quantization === 'sq4';
     const out = new Uint8Array(packed ? Math.ceil(this.dim / 2) : this.dim);
@@ -472,6 +523,12 @@ export class HnswIndex {
 
   /** dequantized aux scalars, fully derivable from codes + calibration */
   private auxOf(buf: Uint8Array): Aux {
+    if (this.quantization === 'pq') {
+      const v = reconstructPq(this.pq!, buf);
+      let norm2 = 0;
+      for (let d = 0; d < this.dim; d++) norm2 += v[d]! * v[d]!;
+      return { dotC: 0, norm: Math.sqrt(norm2), selfW: 0, xsm: 0 };
+    }
     const cal = this.calibration!;
     const packed = this.quantization === 'sq4';
     let dotC = 0;
@@ -508,6 +565,7 @@ export class HnswIndex {
   }
 
   private dequantize(buf: Uint8Array): Float32Array {
+    if (this.quantization === 'pq') return reconstructPq(this.pq!, buf);
     const cal = this.calibration!;
     const packed = this.quantization === 'sq4';
     const out = new Float32Array(this.dim);
@@ -524,14 +582,53 @@ export class HnswIndex {
       return { vec: prepareVector(query, this.metric, this.dim), aux: null };
     }
     const f = prepareVector(query, this.metric, this.dim);
+    if (this.quantization === 'pq') return this.pqQuery(f);
     if (this.metric === 'euclidean') return this.adcQuery(f);
     const u8 = this.quantizeStored(f);
     return { vec: u8, aux: this.auxOf(u8) };
   }
 
+  /** asymmetric PQ query: per-subspace distance/dot table against every centroid */
+  private pqQuery(f: Float32Array): QVec {
+    const model = this.pq!;
+    const table = new Float32Array(model.m * 256);
+    for (let i = 0; i < model.m; i++) {
+      const off = model.offsets[i]!;
+      const len = model.segLens[i]!;
+      const cb = model.codebooks[i]!;
+      for (let c = 0; c < model.k; c++) {
+        const base = c * len;
+        let acc = 0;
+        if (this.metric === 'euclidean') {
+          for (let d = 0; d < len; d++) {
+            const diff = f[off + d]! - cb[base + d]!;
+            acc += diff * diff;
+          }
+        } else {
+          for (let d = 0; d < len; d++) acc += f[off + d]! * cb[base + d]!;
+        }
+        table[i * 256 + c] = acc;
+      }
+    }
+    let norm2 = 0;
+    for (let d = 0; d < this.dim; d++) norm2 += f[d]! * f[d]!;
+    return { vec: f, aux: { dotC: 0, norm: Math.sqrt(norm2), selfW: 0, xsm: 0 }, table };
+  }
+
   private dist(h: number, q: QVec): number {
     const node = this.nodes[h]!;
     if (this.calibration === null) return this.distF32(node.vec as Float32Array, q.vec as Float32Array);
+    if (this.quantization === 'pq') {
+      const codes = node.vec as Uint8Array;
+      const model = this.pq!;
+      const table = q.table!;
+      let s = 0;
+      for (let i = 0; i < model.m; i++) s += table[i * 256 + codes[i]!];
+      if (this.metric === 'euclidean') return Math.sqrt(Math.max(0, s));
+      if (this.metric === 'dot') return -s;
+      const denom = q.aux!.norm * node.aux!.norm;
+      return denom === 0 ? 1 : 1 - s / denom;
+    }
     if (this.metric === 'euclidean') return this.distAdc!(node, q);
     return this.distQ!({ vec: node.vec, aux: node.aux }, q);
   }
@@ -542,6 +639,9 @@ export class HnswIndex {
     }
     const na = this.nodes[a]!;
     const nb = this.nodes[b]!;
+    if (this.quantization === 'pq') {
+      return distPqSym(this.pq!, na.vec as Uint8Array, nb.vec as Uint8Array, this.metric, na.aux!.norm, nb.aux!.norm);
+    }
     return this.distQ!({ vec: na.vec, aux: na.aux }, { vec: nb.vec, aux: nb.aux });
   }
 
@@ -638,8 +738,9 @@ export class HnswIndex {
   /**
    * Degenerate-graph fallback: when the beam comes back empty every existing
    * node is a deleted anchor (e.g. a single-id upsert chain). Link the new
-   * node to the nearest existing nodes regardless of deletion — connectivity
-   * beats tombstone purity, and compaction reclaims the links later.
+   * node to the M most recently inserted nodes regardless of deletion —
+   * cheap, deterministic, and for the single-id chain exactly what's needed.
+   * Connectivity beats tombstone purity; compaction reclaims the links later.
    */
   private anchorFallback(q: QVec, self: number, level: number): Cand[] {
     const cands: Cand[] = [];
@@ -720,9 +821,21 @@ export class HnswIndex {
     w.u32(this.efConstruction);
     w.u32(this.seed);
     const cal = this.calibration;
-    w.u8(cal !== null ? (this.quantization === 'sq4' ? 4 : 2) : this.quantization === 'sq4' ? 3 : this.quantization === 'sq8' ? 1 : 0); // 0 f32 · 1 sq8-uncal · 2 sq8-cal · 3 sq4-uncal · 4 sq4-cal
-    if (cal !== null) {
-      for (let d = 0; d < this.dim; d++) w.f32(cal.min[d]!).f32(cal.max[d]!);
+    const quantParam = this.quantization === 'none' ? 0 : this.quantization === 'sq8' ? 1 : this.quantization === 'sq4' ? 2 : 3;
+    const storage = cal === null ? 0 : this.quantization === 'pq' ? 3 : this.quantization === 'sq4' ? 2 : 1;
+    w.u8(quantParam);
+    w.u8(storage);
+    if (storage === 1 || storage === 2) {
+      for (let d = 0; d < this.dim; d++) w.f32(cal!.min[d]!).f32(cal!.max[d]!);
+    }
+    if (storage === 3) {
+      const model = this.pq!;
+      w.u32(model.m);
+      w.u16(model.k);
+      for (let i = 0; i < model.m; i++) {
+        w.u16(model.segLens[i]!);
+        w.bytes(new Uint8Array(model.codebooks[i]!.buffer, model.codebooks[i]!.byteOffset, model.codebooks[i]!.byteLength));
+      }
     }
     w.u32(this.nodes.length);
     w.i32(this.entry);
@@ -733,7 +846,7 @@ export class HnswIndex {
       w.u8(node.deleted ? 1 : 0);
       if (cal !== null) {
         const v = node.vec as Uint8Array;
-        const n = this.quantization === 'sq4' ? (this.dim + 1) >> 1 : this.dim;
+        const n = this.quantization === 'pq' ? this.pq!.m : this.quantization === 'sq4' ? (this.dim + 1) >> 1 : this.dim;
         for (let i = 0; i < n; i++) w.u8(v[i]!);
       } else {
         const v = node.vec as Float32Array;
@@ -761,17 +874,26 @@ export class HnswIndex {
     const M = r.u32();
     const efConstruction = r.u32();
     const seed = r.u32();
-    const quantCode = version >= 2 ? r.u8() : 0;
-    const calibrated = quantCode === 2 || quantCode === 4;
+    let quantParam = version >= 2 ? r.u8() : 0;
+    let storage = 0;
+    if (version >= 3) {
+      storage = r.u8();
+    } else {
+      // v2 packed the two axes into one byte
+      storage = quantParam === 2 ? 1 : quantParam === 4 ? 2 : 0;
+      quantParam = quantParam === 0 ? 0 : quantParam <= 2 ? 1 : 2;
+    }
+    const calibrated = storage !== 0;
+    const quantization: Quantization = quantParam === 0 ? 'none' : quantParam === 1 ? 'sq8' : quantParam === 2 ? 'sq4' : 'pq';
     const idx = new HnswIndex({
       dim,
       metric,
       M,
       efConstruction,
       seed,
-      quantization: quantCode === 0 ? 'none' : quantCode <= 2 ? 'sq8' : 'sq4',
+      quantization,
     });
-    if (quantCode === 2 || quantCode === 4) {
+    if (storage === 1 || storage === 2) {
       const min = new Float32Array(dim);
       const max = new Float32Array(dim);
       for (let d = 0; d < dim; d++) {
@@ -782,14 +904,44 @@ export class HnswIndex {
       const c = new Float32Array(dim);
       let k = 0;
       for (let d = 0; d < dim; d++) {
-        step[d] = (max[d]! - min[d]!) / (quantCode === 4 ? 15 : 255);
+        step[d] = (max[d]! - min[d]!) / (storage === 2 ? 15 : 255);
         c[d] = step[d]! * min[d]!;
         k += min[d]! * min[d]!;
       }
-      idx.calibration = { min, max, step, c, k, levels: quantCode === 4 ? 15 : 255 };
-      const packed = quantCode === 4;
+      idx.calibration = { min, max, step, c, k, levels: storage === 2 ? 15 : 255 };
+      const packed = storage === 2;
       idx.distQ = metric === 'euclidean' ? distQEuclidean(idx.calibration, packed) : distQIp(idx.calibration, metric === 'cosine', packed);
       idx.distAdc = metric === 'euclidean' ? distQAdcEuclidean(idx.calibration, packed) : null;
+    }
+    if (storage === 3) {
+      const m = r.u32();
+      const k = r.u16();
+      const segLens: number[] = [];
+      const codebooks: Float32Array[] = [];
+      // interleaved to match the writer: u16 segLen then its codebook bytes
+      for (let i = 0; i < m; i++) {
+        segLens.push(r.u16());
+        const raw = r.bytes(k * segLens[i]! * 4);
+        codebooks.push(new Float32Array(raw.buffer, raw.byteOffset, k * segLens[i]!));
+      }
+      const offsets: number[] = [];
+      let off = 0;
+      for (let i = 0; i < m; i++) {
+        offsets.push(off);
+        off += segLens[i]!;
+      }
+      idx.pq = { m, k, segLens, offsets, codebooks };
+      // sentinel calibration keeps the calibrated-flag machinery uniform (same as calibrate())
+      idx.calibration = {
+        min: new Float32Array(dim),
+        max: new Float32Array(dim).fill(1),
+        step: new Float32Array(dim).fill(1 / 255),
+        c: new Float32Array(dim),
+        k: 0,
+        levels: 255,
+      };
+      idx.distQ = null;
+      idx.distAdc = null; // pq runs through the table branch in dist()
     }
     const count = r.u32();
     const entry = r.i32();
@@ -801,7 +953,7 @@ export class HnswIndex {
       if (level > MAX_LEVEL) throw new Error(`corrupt index: node level ${level} > ${MAX_LEVEL}`);
       let vec: Float32Array | Uint8Array;
       if (calibrated) {
-        const nbytes = quantCode === 4 ? (dim + 1) >> 1 : dim;
+        const nbytes = storage === 3 ? (idx.pq as PqModel).m : storage === 2 ? (dim + 1) >> 1 : dim;
         const u8 = new Uint8Array(nbytes);
         for (let j = 0; j < nbytes; j++) u8[j] = r.u8();
         vec = u8;
@@ -863,7 +1015,7 @@ function distQEuclidean(cal: Calibration, packed: boolean): (a: QVec, b: QVec) =
       let s = 0;
       for (let d = 0; d < dim; d++) {
         const diff = decodeCode(va, d, true) - decodeCode(vb, d, true);
-        s += diff * diff * step[d]!;
+        s += diff * diff * step[d]! * step[d]!;
       }
       return Math.sqrt(s);
     };
@@ -874,7 +1026,7 @@ function distQEuclidean(cal: Calibration, packed: boolean): (a: QVec, b: QVec) =
     let s = 0;
     for (let d = 0; d < dim; d++) {
       const diff = va[d]! - vb[d]!;
-      s += diff * diff * step[d]!;
+      s += diff * diff * step[d]! * step[d]!;
     }
     return Math.sqrt(s);
   };

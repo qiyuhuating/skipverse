@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-10-06
+
+- **Product quantization (PQ)**: quantization: "pq" with pqSubspaces — deterministic k-means codebooks (k-means++ + 12 Lloyd iterations on mulberry32), asymmetric ADC via a per-query m×256 table. **At the same 8× compression PQ scores 0.742 recall@10 where SQ4 scores 0.589** (+15 points); trade is ~3× slower calibrate (k-means training). Version-3 serialized; older indexes still load.
+- **Concurrent read pool**: SearchPool — worker threads hold read-only snapshots; searches never block the writer.
+- **Fixed: single-id upsert chains disconnected the graph** (found by the invariant suite) — empty-beam inserts now anchor to recent nodes.
+- **Fixed: calibrated euclidean inter-node distances** used step instead of step² (adversarial review, reproduced).
+- **Fixed: add(rawCodeUint8Array) crashed** on calibrated euclidean indexes (missing ADC anchor).
+- **extendCandidates** implemented and honestly benchmarked: +0.006 recall for ~2× build — kept, default off.
+- **Invariant suite** (11 tests) + adversarial-review fixes (compacted carries extendCandidates; M ≤ 32767).
+- README API reference (HnswIndex / SearchPool / VectorStore / HTTP / CLI). 77 tests green.
+
 ## 0.3.3 — 2026-10-06
 
 - **Concurrent read pool**: `SearchPool` (src/node/pool.ts) spawns worker threads holding read-only index

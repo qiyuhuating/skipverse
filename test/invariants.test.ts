@@ -343,3 +343,62 @@ describe('mixed write paths', () => {
     reopened.close();
   });
 });
+
+describe('adversarial-review regressions', () => {
+  it('MAJOR-2: add(raw u8 codes) on a calibrated euclidean index stays searchable', () => {
+    const idx = new HnswIndex({ dim: 8, metric: 'euclidean', quantization: 'sq8', M: 4, seed: 2 });
+    const v = [10, 20, 30, 40, 50, 60, 70, 80];
+    idx.add('a', v);
+    idx.add('b', [1, 2, 3, 4, 5, 6, 7, 8]);
+    idx.calibrate();
+    // raw-code reinsertion: codes are interpreted in code space, so the
+    // stored vector is the dequantized range, not the byte values
+    idx.add('c', new Uint8Array([12, 22, 32, 42, 52, 62, 72, 82]));
+    assert.equal(idx.size, 3);
+    const stored = idx.vector('c')!;
+    const got = idx.search(Array.from(stored), 1, { ef: 32 });
+    assert.equal(got[0]!.id, 'c', 'searching for the dequantized vector must find it');
+    // code 12 in dim 0 decodes to min + 12·step — inside [1, 10], the frozen training range
+    assert.ok(stored[0]! >= 1 && stored[0]! <= 12, `decoded value ${stored[0]!.toFixed(2)} must lie in the frozen range`);
+  });
+
+  it('MAJOR-1: calibrated euclidean distances respect per-dimension scale', () => {
+    // dims of wildly different magnitudes — the step² weighting must keep the
+    // graph distances consistent with the true dequantized geometry
+    const { vecs, queries } = genClusterData(400, 8, 5, 13);
+    const scaled = vecs.map((v) => {
+      const out = new Float32Array(8);
+      for (let d = 0; d < 8; d++) out[d] = d < 4 ? v[d]! * 100 : v[d]!;
+      return out;
+    });
+    const idx = new HnswIndex({ dim: 8, metric: 'euclidean', quantization: 'sq8', M: 8, seed: 4 });
+    for (let i = 0; i < scaled.length; i++) idx.add(String(i), scaled[i]!);
+    idx.calibrate();
+    const qs = queries.slice(0, 30).map((q) => {
+      const out = new Float32Array(8);
+      for (let d = 0; d < 8; d++) out[d] = d < 4 ? q[d]! * 100 : q[d]!;
+      return out;
+    });
+    let sum = 0;
+    for (const q of qs) {
+      const exact = scaled
+        .map((v, i) => ({ id: String(i), d: Math.sqrt(v.reduce((s, x, d) => s + (x - q[d]!) ** 2, 0)) }))
+        .sort((x, y) => x.d - y.d)
+        .slice(0, 10);
+      sum += recall(exact, idx.search(q, 10, { ef: 64 }));
+    }
+    assert.ok(sum / 30 >= 0.9, `scale-heavy sq8 recall = ${(sum / 30).toFixed(3)}, want ≥ 0.90`);
+  });
+
+  it('MINOR-3: compacted() carries extendCandidates', () => {
+    const idx = new HnswIndex({ dim: 4, metric: 'euclidean', extendCandidates: true, seed: 1 });
+    idx.add('a', [1, 0, 0, 0]);
+    const fresh = idx.compacted();
+    assert.equal(fresh.extendCandidates, true);
+  });
+
+  it('MINOR-5: M beyond u16 degree capacity is rejected', () => {
+    assert.throws(() => new HnswIndex({ dim: 4, M: 40000 }), /[2, 32767]/);
+    assert.doesNotThrow(() => new HnswIndex({ dim: 4, M: 32767 }));
+  });
+});
