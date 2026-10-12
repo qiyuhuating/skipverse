@@ -4,8 +4,20 @@
   "description": "A from-scratch vector database: HNSW approximate nearest neighbor index, zero runtime dependencies, crash-safe WAL, deterministic replay, and a living search visualization.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qiyuhuating/skipverse.git"
+  },
+  "homepage": "https://github.com/qiyuhuating/skipverse#readme",
+  "bugs": {
+    "url": "https://github.com/qiyuhuating/skipverse/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.11.0"
   },
   "main": "./dist/node/index.js",
   "types": "./dist/node/index.d.ts",
@@ -14,6 +26,8 @@
   },
   "files": [
     "dist",
+    "demo/index.html",
+    "demo/bundle.js",
     "README.md",
     "LICENSE"
   ],
@@ -26,7 +40,8 @@
     "example": "tsx examples/quickstart.ts",
     "bench": "tsx bench/bench.ts",
     "bench:ci": "tsx bench/bench.ts --small --assert",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "prepack": "npm run build && npm run demo:build",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "keywords": [
     "vector-database",

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { VectorStore, type StoreOptions } from './store.js';
@@ -21,7 +22,7 @@ function storeOptionsFrom(flags: { data?: string; dim?: string; metric?: string;
 const USAGE = `skipverse — a from-scratch vector database (HNSW, zero deps)
 
   skipverse serve   --port 8787 --data ./data --dim 64 --metric cosine
-                    [--M 16] [--ef-construction 200] [--quantization sq8|sq4]
+                    [--M 16] [--ef-construction 200]
   skipverse calibrate --data ./data --dim 64
                     (freeze ranges + rewrite codes on a quantized store)
   skipverse import  --file vectors.jsonl --data ./data --dim 64
