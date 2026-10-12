@@ -4,9 +4,9 @@ A TypeScript vector search engine with an HNSW index, WAL-backed storage and a b
 
 **[Live demo →](https://qiyuhuating.github.io/skipverse/)** · [API reference](#api-reference)
 
-Node.js 20+ · ESM · Zero runtime dependencies
+Node.js 20.11+ · ESM · Zero runtime dependencies
 
-![HNSW graph](docs/screenshot-graph.png)
+![HNSW graph](https://raw.githubusercontent.com/qiyuhuating/skipverse/main/docs/screenshot-graph.png)
 
 The browser demo uses the same HnswIndex core as the Node.js engine. Watch the search descend through graph layers and select the nearest results.
 
@@ -18,9 +18,40 @@ The browser demo uses the same HnswIndex core as the Node.js engine. Watch the s
 - CRC-framed WAL, snapshot checkpoints and deterministic replay.
 - HTTP API, CLI and worker-thread read snapshots.
 
+## Install
+
+```sh
+npm install skipverse
+```
+
+```js
+import { HnswIndex, VectorStore } from "skipverse";
+```
+
+Start the HTTP server and browser demo:
+
+```sh
+npx skipverse serve --port 8787 --data ./skipverse-data --dim 64 --metric cosine
+```
+
+Open http://127.0.0.1:8787 . All vectors in a store must have the configured dimension.
+Use a separate data directory when changing dimensions or metrics.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--port` | `8787` | HTTP port |
+| `--data` | `./skipverse-data` | Persistent store directory |
+| `--dim` | `64` | Vector dimension |
+| `--metric` | `cosine` | `cosine`, `euclidean` or `dot` |
+| `--M` | `16` | HNSW neighbor budget |
+| `--ef-construction` | `200` | HNSW build search budget |
+
+Set query-time `ef` in the `/search` request body. Quantization and `fsync` are configured
+through the `VectorStore` API; the current CLI does not expose these settings.
+
 ## Run from source
 
-Build the repository locally; the commands below do not require a published npm package.
+To develop or build locally:
 
 ```sh
 git clone https://github.com/qiyuhuating/skipverse.git
@@ -159,10 +190,11 @@ Every response carries an `x-response-time` header.
 
 | command | flags | purpose |
 |:--|:--|:--|
-| `skipverse serve` | `--port --data --dim --metric --M --ef-construction --quantization` | HTTP + demo |
+| `skipverse serve` | `--port --data --dim --metric --M --ef-construction` | HTTP + demo |
 | `skipverse import` | `--file vectors.jsonl` + store flags | bulk load (500/batch) |
 | `skipverse calibrate` | store flags | freeze ranges + rewrite codes |
 
 ## License
 
 [MIT](LICENSE) © 2026 qiyuhuating
+
